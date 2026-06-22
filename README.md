@@ -12,13 +12,13 @@ Loop Police catches both **mid-stream** (not after the fact), aborts the looping
 ## Install
 
 ```bash
-pi install git:github.com/sebaxzero/pi-loop-police
+pi install git:github.com/sebaxzero/pi-loop-police.git
 ```
 
 Or try it without installing:
 
 ```bash
-pi -e git:github.com/sebaxzero/pi-loop-police
+pi -e git:github.com/sebaxzero/pi-loop-police.git
 ```
 
 ## How it works

@@ -15,10 +15,10 @@ Loop Police catches both **mid-stream** (not after the fact), aborts the looping
 pi install git:github.com/sebaxzero/pi-loop-police.git
 ```
 
-Or try it without installing:
+Or install project-locally (adds to `.pi/settings.json` only):
 
 ```bash
-pi -e git:github.com/sebaxzero/pi-loop-police.git
+pi install git:github.com/sebaxzero/pi-loop-police.git -l
 ```
 
 ## How it works

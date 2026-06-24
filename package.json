@@ -8,6 +8,7 @@
     "test": "node --test test.mjs"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
   }
 }

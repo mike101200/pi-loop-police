@@ -69,7 +69,9 @@ Example: `/loop-police set FILE_READ_LIMIT=6 STAGNATION_WINDOW=5`
 
 ## Configuration
 
-All values are tunable at runtime via `/loop-police set KEY=VAL`. Defaults:
+Persistent configuration lives in `extensions/loop-police.json` (auto-created on first load with defaults). You can ask the agent to edit it directly, or tune values live with `/loop-police set KEY=VAL`.
+
+Defaults:
 
 ```typescript
 MIN_THINKING_WINDOW: 80     // shortest repeating phrase to flag (chars)

@@ -52,10 +52,9 @@ loops in real time before they exhaust your context window.
 
 **Persistent** (survives restarts): edit `loop-police.json` in the extensions directory.
 
-Global git install path:
-```
-~/.pi/agent/git/github.com/sebaxzero/pi-loop-police/extensions/loop-police.json
-```
+The config lives next to the extension file and is auto-created on first load:
+- **Global install**: `~/.pi/agent/extensions/pi-loop-police/extensions/loop-police.json`
+- **Local install**: `<project>/.pi/extensions/pi-loop-police/extensions/loop-police.json`
 
 Example `loop-police.json`:
 ```json

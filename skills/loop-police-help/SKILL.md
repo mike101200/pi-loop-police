@@ -18,6 +18,7 @@ loops in real time before they exhaust your context window.
 - **File read loop**: same file read ≥ FILE_READ_LIMIT times in one turn
 - **Search spiral**: same pattern searched across ≥ SEARCH_EXPAND_LIMIT paths
 - **Tool call loop**: identical sequence of tool calls repeating
+- **Consecutive loop**: same thinking loop detected N times in a row (new)
 
 ## Commands
 
@@ -41,6 +42,7 @@ loops in real time before they exhaust your context window.
 | `STAGNATION_THRESHOLD` | `0.85` | Jaccard similarity threshold for stagnation |
 | `FILE_READ_LIMIT` | `4` | Block file reads at or above this count |
 | `SEARCH_EXPAND_LIMIT` | `3` | Block search pattern at or above this many paths |
+| `CONSECUTIVE_LOOP_LIMIT` | `2` | Abort and alert after N consecutive thinking loops in the same turn |
 
 ## Changing config
 

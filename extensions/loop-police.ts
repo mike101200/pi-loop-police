@@ -20,6 +20,7 @@ const DEFAULTS = {
   STAGNATION_THRESHOLD: 0.85,
   FILE_READ_LIMIT: 4,
   SEARCH_EXPAND_LIMIT: 3,
+  CONSECUTIVE_LOOP_LIMIT: 2,
 };
 
 const cfg: typeof DEFAULTS & { [key: string]: number } = (() => {
@@ -48,6 +49,7 @@ export default function (pi: ExtensionAPI) {
   let thinkingHistory: string[] = [];
   let fileReadCounts = new Map<string, number>();
   let searchPatternPaths = new Map<string, Set<string>>();
+  let consecutiveLoopCount = 0;
 
   function reset() {
     thinkingAborted = false;
@@ -59,6 +61,7 @@ export default function (pi: ExtensionAPI) {
     thinkingHistory = [];
     fileReadCounts = new Map();
     searchPatternPaths = new Map();
+    consecutiveLoopCount = 0;
   }
 
   pi.on("agent_start", reset);
@@ -69,6 +72,7 @@ export default function (pi: ExtensionAPI) {
     cleanThinkingPrefix = null;
     loopType = "character";
     toolLoopTriggered = false; // allow recovery turns to use tools
+    consecutiveLoopCount = 0; // reset per turn
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -89,6 +93,21 @@ export default function (pi: ExtensionAPI) {
 
     thinkingAborted = true;
     cleanThinkingPrefix = repeat.cleanPrefix;
+    consecutiveLoopCount++;
+
+    if (consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT) {
+      ctx.abort();
+      pi.sendMessage(
+        {
+          customType: "loop-police",
+          content: `⚠️ CONSECUTIVE LOOP (${consecutiveLoopCount}x): You have entered a thinking loop ${consecutiveLoopCount} times in a row. Loop-police has aborted your thinking ${consecutiveLoopCount} time(s). Stop thinking and provide a direct answer or ask for clarification.`,
+          display: true,
+        },
+        { triggerTurn: true }
+      );
+      return;
+    }
+
     ctx.abort();
   });
 
@@ -250,6 +269,7 @@ export default function (pi: ExtensionAPI) {
           `  stagnation history:  ${thinkingHistory.length}/${cfg.STAGNATION_WINDOW} turns`,
           `  file reads tracked:  ${fileReadCounts.size} paths`,
           `  search patterns:     ${searchPatternPaths.size} patterns`,
+          `  consecutive loops:   ${consecutiveLoopCount}/${cfg.CONSECUTIVE_LOOP_LIMIT}`,
           "",
           "  config (set KEY=VAL to change):",
           ...Object.entries(cfg).map(([k, v]) => `    ${k}=${v}`),

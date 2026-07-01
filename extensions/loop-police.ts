@@ -1,8 +1,14 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { attemptModelReload, deriveAdminBaseUrl } from "./llama-reload.ts";
+import {
+  fingerprintUserPromptFromBranch,
+  shouldCountPersistFailure,
+  type PromptFingerprints,
+} from "./response-quality.ts";
 
 // Config lives next to the extension file: ./extensions/loop-police.json
 // Auto-created on first load with defaults; travels with the extension.
@@ -22,13 +28,16 @@ const DEFAULTS = {
   FILE_READ_LIMIT: 4,
   SEARCH_EXPAND_LIMIT: 3,
   CONSECUTIVE_LOOP_LIMIT: 2,
-  COMMAND_EXCEPTION_LIST: ["wiki-ingest", "LLM-WIKI"],
+  COMMAND_EXCEPTION_LIST: [] as string[],
+  MODEL_RELOAD_ENABLED: true,
+  MODEL_RELOAD_THRESHOLD: 3,
+  MODEL_RELOAD_COOLDOWN_MS: 120000,
 };
 
 type LoopPoliceConfig = typeof DEFAULTS;
 
 function parseConfigValue(key: string, val: string): unknown {
-  if (key === "ENABLED") return val === "true" || val === "1";
+  if (key === "ENABLED" || key === "MODEL_RELOAD_ENABLED") return val === "true" || val === "1";
   if (key === "COMMAND_EXCEPTION_LIST") {
     return val.split(",").map((s) => s.trim()).filter(Boolean);
   }
@@ -37,7 +46,7 @@ function parseConfigValue(key: string, val: string): unknown {
 }
 
 function formatConfigValue(key: string, val: unknown): string {
-  if (key === "ENABLED") return String(val);
+  if (key === "ENABLED" || key === "MODEL_RELOAD_ENABLED") return String(val);
   if (key === "COMMAND_EXCEPTION_LIST") return (val as string[]).join(",");
   return String(val);
 }
@@ -56,6 +65,10 @@ function loadConfig(): LoopPoliceConfig {
       ...DEFAULTS,
       ...parsed,
       ENABLED: parsed.ENABLED !== undefined ? Boolean(parsed.ENABLED) : DEFAULTS.ENABLED,
+      MODEL_RELOAD_ENABLED:
+        parsed.MODEL_RELOAD_ENABLED !== undefined
+          ? Boolean(parsed.MODEL_RELOAD_ENABLED)
+          : DEFAULTS.MODEL_RELOAD_ENABLED,
       COMMAND_EXCEPTION_LIST: Array.isArray(parsed.COMMAND_EXCEPTION_LIST)
         ? parsed.COMMAND_EXCEPTION_LIST
         : DEFAULTS.COMMAND_EXCEPTION_LIST,
@@ -83,6 +96,76 @@ export default function (pi: ExtensionAPI) {
   let fileReadCounts = new Map<string, number>();
   let searchPatternPaths = new Map<string, Set<string>>();
   let consecutiveLoopCount = 0;
+  let persistFailureCount = 0;
+  let lastReloadAt = 0;
+  let reloadInProgress = false;
+  let lastResolvedAdminUrl: string | null = null;
+  let lastPromptFingerprints: PromptFingerprints | null = null;
+
+  async function recordPersistFailure(reason: string, ctx: ExtensionContext) {
+    persistFailureCount++;
+    if (!cfg.MODEL_RELOAD_ENABLED || persistFailureCount < cfg.MODEL_RELOAD_THRESHOLD) return;
+    await maybeReloadModel(ctx, reason);
+  }
+
+  async function maybeReloadModel(ctx: ExtensionContext, reason: string) {
+    if (reloadInProgress) return;
+    const now = Date.now();
+    if (now - lastReloadAt < cfg.MODEL_RELOAD_COOLDOWN_MS) return;
+
+    const model = ctx.model;
+    if (!model?.baseUrl) {
+      ctx.ui.notify("Loop Police: model reload skipped — no baseUrl on active model", "warning");
+      lastReloadAt = now;
+      return;
+    }
+
+    reloadInProgress = true;
+    lastResolvedAdminUrl = deriveAdminBaseUrl(model.baseUrl);
+
+    try {
+      const authResult = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      const auth = authResult.ok
+        ? { apiKey: authResult.apiKey, headers: authResult.headers }
+        : undefined;
+
+      ctx.ui.notify(`Loop Police: reloading model (${reason})…`, "warning");
+      const result = await attemptModelReload(model.baseUrl, model.id, auth);
+
+      lastReloadAt = Date.now();
+      persistFailureCount = 0;
+      lastPromptFingerprints = null;
+
+      if (result.ok) {
+        reset();
+        ctx.ui.notify(`Loop Police: ${result.message}`, "info");
+        pi.sendMessage(
+          {
+            customType: "loop-police",
+            content: `🔄 MODEL RELOADED: Persistent loops detected (${reason}). The llama-server model was reloaded to clear bad KV/state. Server CLI settings are unchanged — only runtime cache was reset. Continue with a fresh approach.`,
+            display: true,
+          },
+          { triggerTurn: true }
+        );
+      } else {
+        ctx.ui.notify(`Loop Police: model reload skipped — ${result.message}`, "warning");
+        pi.sendMessage(
+          {
+            customType: "loop-police",
+            content: `⚠️ MODEL RELOAD SKIPPED: Persistent loops detected (${reason}) but automatic reload failed (${result.message}). Try manual docker restart or router-mode llama-server if this keeps happening.`,
+            display: true,
+          },
+          { triggerTurn: true }
+        );
+      }
+    } catch (err) {
+      lastReloadAt = Date.now();
+      const msg = err instanceof Error ? err.message : String(err);
+      ctx.ui.notify(`Loop Police: model reload error — ${msg}`, "error");
+    } finally {
+      reloadInProgress = false;
+    }
+  }
 
   function reset() {
     thinkingAborted = false;
@@ -96,6 +179,8 @@ export default function (pi: ExtensionAPI) {
     fileReadCounts = new Map();
     searchPatternPaths = new Map();
     consecutiveLoopCount = 0;
+    persistFailureCount = 0;
+    lastPromptFingerprints = null;
   }
 
   pi.on("agent_start", reset);
@@ -109,7 +194,7 @@ export default function (pi: ExtensionAPI) {
     consecutiveLoopCount = 0; // reset per turn
   });
 
-  pi.on("message_update", (event, ctx) => {
+  pi.on("message_update", async (event, ctx) => {
     if (!isEnabled() || thinkingAborted || event.message.role !== "assistant") return;
     const thinking = extractThinking(event.message);
     if (!thinking || thinking.length < lastCheckedLen + cfg.CHECK_STRIDE) return;
@@ -128,6 +213,7 @@ export default function (pi: ExtensionAPI) {
     thinkingAborted = true;
     cleanThinkingPrefix = repeat.cleanPrefix;
     consecutiveLoopCount++;
+    void recordPersistFailure("thinking loop", ctx);
 
     if (consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT) {
       ctx.abort();
@@ -145,7 +231,7 @@ export default function (pi: ExtensionAPI) {
     ctx.abort();
   });
 
-  pi.on("message_end", (event, _ctx) => {
+  pi.on("message_end", async (event, ctx) => {
     if (!isEnabled() || event.message.role !== "assistant") return;
 
     if (thinkingAborted) {
@@ -182,6 +268,7 @@ export default function (pi: ExtensionAPI) {
         );
         if (stagnant) {
           thinkingHistory = [];
+          void recordPersistFailure("reasoning stagnation", ctx);
           pi.sendMessage(
             {
               customType: "loop-police",
@@ -195,7 +282,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (!isEnabled()) return;
 
     const excepted = isExceptedTool(event.toolName);
@@ -208,6 +295,7 @@ export default function (pi: ExtensionAPI) {
         const count = (fileReadCounts.get(readKey) ?? 0) + 1;
         fileReadCounts.set(readKey, count);
         if (count >= cfg.FILE_READ_LIMIT) {
+          void recordPersistFailure("file read loop", ctx);
           ctx.ui.notify(`⚠️ FILE READ LOOP: "${readKey}" read ${count}x — blocked`, "warning");
           pi.sendMessage(
             {
@@ -231,6 +319,7 @@ export default function (pi: ExtensionAPI) {
         paths.add(searchPath);
         searchPatternPaths.set(pattern, paths);
         if (paths.size >= cfg.SEARCH_EXPAND_LIMIT) {
+          void recordPersistFailure("search spiral", ctx);
           ctx.ui.notify(`⚠️ SEARCH SPIRAL: "${pattern}" across ${paths.size} paths — blocked`, "warning");
           pi.sendMessage(
             {
@@ -259,6 +348,7 @@ export default function (pi: ExtensionAPI) {
 
       if (windowSize > 0) {
         toolLoopTriggered = true;
+        void recordPersistFailure("tool call loop", ctx);
         ctx.ui.notify(`⚠️ TOOL LOOP: ${windowSize}-call sequence repeating — blocked`, "warning");
         pi.sendMessage(
           {
@@ -272,6 +362,23 @@ export default function (pi: ExtensionAPI) {
       }
 
       sequenceHistory.push(hash);
+    }
+  });
+
+  pi.on("turn_end", async (event, ctx) => {
+    if (!isEnabled() || event.message.role !== "assistant") return;
+
+    const branch = ctx.sessionManager.getBranch() as unknown[];
+    const quality = shouldCountPersistFailure(event.message, branch, lastPromptFingerprints);
+
+    if (quality.curr) {
+      lastPromptFingerprints = quality.curr;
+    }
+
+    if (quality.count && quality.reason) {
+      await recordPersistFailure(quality.reason, ctx);
+    } else if (!quality.count) {
+      persistFailureCount = 0;
     }
   });
 
@@ -315,6 +422,11 @@ export default function (pi: ExtensionAPI) {
           `  file reads tracked:  ${fileReadCounts.size} keys`,
           `  search patterns:     ${searchPatternPaths.size} patterns`,
           `  consecutive loops:   ${consecutiveLoopCount}/${cfg.CONSECUTIVE_LOOP_LIMIT}`,
+          `  persist failures:    ${persistFailureCount}/${cfg.MODEL_RELOAD_THRESHOLD}`,
+          `  model reload:        ${cfg.MODEL_RELOAD_ENABLED ? "enabled" : "disabled"}`,
+          `  reload in progress:  ${reloadInProgress}`,
+          `  last reload:         ${lastReloadAt ? new Date(lastReloadAt).toISOString() : "never"}`,
+          `  admin URL:           ${lastResolvedAdminUrl ?? (ctx.model?.baseUrl ? deriveAdminBaseUrl(ctx.model.baseUrl) : "n/a")}`,
           "",
           "  config (set KEY=VAL to change):",
           ...Object.entries(cfg).map(([k, v]) => `    ${k}=${formatConfigValue(k, v)}`),

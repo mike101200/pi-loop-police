@@ -99,10 +99,10 @@ function getSearchPattern(input) {
   return input.pattern ?? input.query ?? input.regex ?? input.search ?? input.term ?? null;
 }
 
-const COMMAND_EXCEPTION_LIST = ["wiki-ingest", "LLM-WIKI"];
+const COMMAND_EXCEPTION_LIST = [];
 
-function isExceptedTool(toolName) {
-  return COMMAND_EXCEPTION_LIST.some(
+function isExceptedTool(toolName, list = COMMAND_EXCEPTION_LIST) {
+  return list.some(
     (name) => toolName === name || toolName.toLowerCase() === name.toLowerCase()
   );
 }
@@ -154,8 +154,8 @@ function trackFileRead(fileReadCounts, path, input, limit) {
   return { readKey, count, blocked: count >= limit };
 }
 
-function trackSequenceCall(sequenceHistory, toolName, input) {
-  if (isExceptedTool(toolName)) return { blocked: false, windowSize: 0 };
+function trackSequenceCall(sequenceHistory, toolName, input, exceptionList = COMMAND_EXCEPTION_LIST) {
+  if (isExceptedTool(toolName, exceptionList)) return { blocked: false, windowSize: 0 };
   const hash = hashToolCall(toolName, input);
   const candidate = [...sequenceHistory, hash];
   const windowSize = detectSequenceRepeat(candidate);
@@ -514,17 +514,20 @@ describe("getFileReadKey", () => {
 });
 
 describe("isExceptedTool", () => {
-  test("wiki-ingest is excepted", () => assert.ok(isExceptedTool("wiki-ingest")));
-  test("LLM-WIKI is excepted", () => assert.ok(isExceptedTool("LLM-WIKI")));
-  test("case insensitive match", () => assert.ok(isExceptedTool("Wiki-Ingest")));
+  test("wiki-ingest is not excepted by default", () => assert.ok(!isExceptedTool("wiki-ingest")));
+  test("wiki-ingest is excepted when configured", () => assert.ok(isExceptedTool("wiki-ingest", ["wiki-ingest"])));
+  test("LLM-WIKI is not excepted by default", () => assert.ok(!isExceptedTool("LLM-WIKI")));
+  test("case insensitive match when configured", () => assert.ok(isExceptedTool("Wiki-Ingest", ["wiki-ingest"])));
   test("read is not excepted", () => assert.ok(!isExceptedTool("read")));
 });
 
 describe("COMMAND_EXCEPTION_LIST sequence tracking", () => {
+  const wikiExceptions = ["wiki-ingest"];
+
   test("repeated excepted tool does not trigger sequence loop", () => {
     const history = [];
     for (let i = 0; i < 6; i++) {
-      const result = trackSequenceCall(history, "wiki-ingest", { source: `doc-${i}` });
+      const result = trackSequenceCall(history, "wiki-ingest", { source: `doc-${i}` }, wikiExceptions);
       assert.ok(!result.blocked);
     }
     assert.equal(history.length, 0);
@@ -541,10 +544,137 @@ describe("COMMAND_EXCEPTION_LIST sequence tracking", () => {
   test("excepted tool between reads does not pollute sequence history", () => {
     const history = [];
     trackSequenceCall(history, "read", { path: "/foo" });
-    trackSequenceCall(history, "wiki-ingest", { source: "a" });
+    trackSequenceCall(history, "wiki-ingest", { source: "a" }, wikiExceptions);
     const result = trackSequenceCall(history, "read", { path: "/foo" });
     assert.ok(result.blocked);
     assert.equal(result.windowSize, 1);
+  });
+});
+
+// response-quality + llama-reload (mirrored from extensions/*.ts)
+function deriveAdminBaseUrl(apiBaseUrl) {
+  return apiBaseUrl.replace(/\/v1\/?$/i, "").replace(/\/+$/, "");
+}
+
+function extractAssistantText(message) {
+  if (typeof message !== "object" || !message) return "";
+  const content = message.content;
+  if (!Array.isArray(content)) return typeof content === "string" ? content : "";
+  return content
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function extractToolCalls(message) {
+  if (!Array.isArray(message?.content)) return [];
+  return message.content
+    .filter((b) => b?.type === "toolCall" || b?.type === "tool_use")
+    .map((b) => ({ name: b.name ?? b.toolName ?? "", args: b.arguments ?? b.input ?? b.args ?? {} }));
+}
+
+function isValidToolCall(call) {
+  if (!call.name.trim()) return false;
+  if (call.args == null) return false;
+  if (typeof call.args === "string") {
+    const t = call.args.trim();
+    if (!t) return false;
+    try { JSON.parse(t); } catch { return false; }
+  }
+  return true;
+}
+
+function isMalformedResponse(message) {
+  const text = extractAssistantText(message);
+  const tools = extractToolCalls(message);
+  if (!text && tools.length === 0) return true;
+  if (tools.length > 0 && tools.every((t) => !isValidToolCall(t))) return true;
+  return false;
+}
+
+function fingerprintAssistantOutput(message) {
+  const text = extractAssistantText(message);
+  const tools = extractToolCalls(message);
+  const toolPart = tools.map((t) => `${t.name}:${stableStringify(t.args)}`).sort().join("|");
+  return `${text}::${toolPart}`;
+}
+
+function isIdenticalAcrossPrompts(prev, curr) {
+  return prev.assistant.length > 0 && prev.assistant === curr.assistant && prev.user !== curr.user;
+}
+
+function shouldCountPersistFailure(message, branch, prev) {
+  if (isMalformedResponse(message)) {
+    const assistant = fingerprintAssistantOutput(message);
+    const userEntry = branch.findLast?.((e) => e?.message?.role === "user");
+    const user = userEntry ? JSON.stringify(userEntry.message?.content ?? "") : "";
+    return { count: true, reason: "malformed response", curr: { assistant, user } };
+  }
+  const assistant = fingerprintAssistantOutput(message);
+  const users = branch.filter((e) => (e?.message ?? e)?.role === "user");
+  const lastUser = users.at(-1);
+  if (!lastUser) return { count: false, curr: null };
+  const user = JSON.stringify((lastUser.message ?? lastUser).content ?? "");
+  const curr = { assistant, user };
+  if (prev && isIdenticalAcrossPrompts(prev, curr)) {
+    return { count: true, reason: "identical response across prompts", curr };
+  }
+  return { count: false, curr };
+}
+
+describe("deriveAdminBaseUrl", () => {
+  test("strips /v1 suffix", () => assert.equal(deriveAdminBaseUrl("http://localhost:8020/v1"), "http://localhost:8020"));
+  test("strips /v1/ suffix", () => assert.equal(deriveAdminBaseUrl("http://127.0.0.1:8080/v1/"), "http://127.0.0.1:8080"));
+  test("no suffix unchanged", () => assert.equal(deriveAdminBaseUrl("http://localhost:8080"), "http://localhost:8080"));
+});
+
+describe("isMalformedResponse", () => {
+  test("empty message is malformed", () => {
+    assert.ok(isMalformedResponse({ role: "assistant", content: [] }));
+  });
+  test("text only is healthy", () => {
+    assert.ok(!isMalformedResponse({ role: "assistant", content: [{ type: "text", text: "hello" }] }));
+  });
+  test("valid tool call is healthy", () => {
+    assert.ok(!isMalformedResponse({
+      role: "assistant",
+      content: [{ type: "toolCall", name: "read", arguments: { path: "/foo" } }],
+    }));
+  });
+  test("all invalid tool calls is malformed", () => {
+    assert.ok(isMalformedResponse({
+      role: "assistant",
+      content: [{ type: "toolCall", name: "", arguments: {} }],
+    }));
+  });
+});
+
+describe("isIdenticalAcrossPrompts", () => {
+  test("same assistant different user", () => {
+    assert.ok(isIdenticalAcrossPrompts(
+      { assistant: "a::", user: "u1" },
+      { assistant: "a::", user: "u2" }
+    ));
+  });
+  test("different assistant", () => {
+    assert.ok(!isIdenticalAcrossPrompts(
+      { assistant: "a::", user: "u1" },
+      { assistant: "b::", user: "u2" }
+    ));
+  });
+});
+
+describe("persistFailureCount simulation", () => {
+  test("threshold triggers after N failures", () => {
+    const threshold = 3;
+    let count = 0;
+    let reloads = 0;
+    const record = () => { count++; if (count >= threshold) reloads++; };
+    record(); record();
+    assert.equal(reloads, 0);
+    record();
+    assert.equal(reloads, 1);
   });
 });
 

@@ -18,7 +18,10 @@ loops in real time before they exhaust your context window.
 - **File read loop**: same file read ≥ FILE_READ_LIMIT times in one turn
 - **Search spiral**: same pattern searched across ≥ SEARCH_EXPAND_LIMIT paths
 - **Tool call loop**: identical sequence of tool calls repeating
-- **Consecutive loop**: same thinking loop detected N times in a row (new)
+- **Consecutive loop**: same thinking loop detected N times in a row
+- **Malformed response**: empty assistant output or invalid tool calls
+- **Identical across prompts**: same assistant reply after a different user message
+- **Model reload**: after persistent failures, reloads llama.cpp model via active `ctx.model.baseUrl`
 
 ## Commands
 
@@ -43,10 +46,18 @@ loops in real time before they exhaust your context window.
 | `FILE_READ_LIMIT` | `4` | Block file reads at or above this count |
 | `SEARCH_EXPAND_LIMIT` | `3` | Block search pattern at or above this many paths |
 | `CONSECUTIVE_LOOP_LIMIT` | `2` | Abort and alert after N consecutive thinking loops in the same turn |
+| `ENABLED` | `true` | Master switch for all loop detection |
+| `COMMAND_EXCEPTION_LIST` | `(empty)` | Tools exempt from sequence-loop detection — e.g. `wiki-ingest` for wiki workflows |
+| `MODEL_RELOAD_ENABLED` | `true` | Reload llama.cpp model after persistent failures |
+| `MODEL_RELOAD_THRESHOLD` | `3` | Persistent failures before model reload |
+| `MODEL_RELOAD_COOLDOWN_MS` | `120000` | Minimum ms between reload attempts |
+
+Model reload uses the active Pi model's `baseUrl` from `models.json` or pi-llama-cpp — no separate server URL in loop-police.json.
 
 ## Changing config
 
 **Session only** (lost on restart):
+
 ```
 /loop-police set FILE_READ_LIMIT=6
 /loop-police set STAGNATION_WINDOW=6 STAGNATION_THRESHOLD=0.9

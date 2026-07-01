@@ -86,6 +86,25 @@ function jaccard(a, b) {
   return union === 0 ? 1 : inter / union;
 }
 
+function setConfigValue(target, pair) {
+  const eq = pair.indexOf("=");
+  if (eq <= 0) return `unknown: ${pair}`;
+  const key = pair.slice(0, eq);
+  const val = pair.slice(eq + 1);
+  if (!(key in target)) return `unknown: ${key}`;
+  if (typeof target[key] === "string") return `not settable: ${key} (edit loop-police.json)`;
+  const num = Number(val);
+  if (val === "" || !Number.isFinite(num)) return `invalid: ${key}=${val}`;
+  target[key] = num;
+  return `${key}=${num}`;
+}
+
+function fmt(template, vars) {
+  return String(template).replace(/\{(\w+)\}/g, (whole, key) =>
+    key in vars ? String(vars[key]) : whole
+  );
+}
+
 function isReadTool(name) { return /\bread|view|cat\b/i.test(name); }
 function isSearchTool(name) { return /grep|search|find|glob|\brg\b/i.test(name); }
 
@@ -436,5 +455,109 @@ describe("stagnation detection", () => {
     const diff = "Let me try something completely new and approach the problem from a totally different angle.";
     // After stagnation is detected and history is cleared, 1 new turn is not stagnant
     assert.ok(!isStagnant([diff], WINDOW, THRESHOLD));
+  });
+});
+
+describe("setConfigValue", () => {
+  test("valid integer assignment mutates and reports", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT=6"), "FILE_READ_LIMIT=6");
+    assert.equal(cfg.FILE_READ_LIMIT, 6);
+  });
+
+  test("valid float assignment", () => {
+    const cfg = { STAGNATION_THRESHOLD: 0.85 };
+    assert.equal(setConfigValue(cfg, "STAGNATION_THRESHOLD=0.9"), "STAGNATION_THRESHOLD=0.9");
+    assert.equal(cfg.STAGNATION_THRESHOLD, 0.9);
+  });
+
+  test("unknown key is rejected without mutation", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "NOPE=3"), "unknown: NOPE");
+    assert.deepEqual(cfg, { FILE_READ_LIMIT: 4 });
+  });
+
+  test("missing '=' is rejected, echoes the full pair", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    // No '=' → the whole token is echoed, not a truncated key.
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT"), "unknown: FILE_READ_LIMIT");
+    assert.equal(cfg.FILE_READ_LIMIT, 4);
+  });
+
+  test("leading '=' (empty key) is rejected, echoes the full pair", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "=5"), "unknown: =5");
+  });
+
+  test("non-numeric value is rejected, no NaN written", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT=abc"), "invalid: FILE_READ_LIMIT=abc");
+    assert.equal(cfg.FILE_READ_LIMIT, 4);
+  });
+
+  test("trailing garbage is rejected (Number, not parseFloat)", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT=3px"), "invalid: FILE_READ_LIMIT=3px");
+    assert.equal(cfg.FILE_READ_LIMIT, 4);
+  });
+
+  test("empty value is rejected", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT="), "invalid: FILE_READ_LIMIT=");
+    assert.equal(cfg.FILE_READ_LIMIT, 4);
+  });
+
+  test("Infinity is rejected as non-finite", () => {
+    const cfg = { FILE_READ_LIMIT: 4 };
+    assert.equal(setConfigValue(cfg, "FILE_READ_LIMIT=Infinity"), "invalid: FILE_READ_LIMIT=Infinity");
+    assert.equal(cfg.FILE_READ_LIMIT, 4);
+  });
+
+  test("negative and zero values are allowed (finite numbers)", () => {
+    const cfg = { CHECK_STRIDE: 50 };
+    assert.equal(setConfigValue(cfg, "CHECK_STRIDE=0"), "CHECK_STRIDE=0");
+    assert.equal(cfg.CHECK_STRIDE, 0);
+  });
+
+  test("string (message) keys are not settable, left unchanged", () => {
+    const cfg = { MSG_TOOL_LOOP: "loop!" };
+    assert.equal(
+      setConfigValue(cfg, "MSG_TOOL_LOOP=5"),
+      "not settable: MSG_TOOL_LOOP (edit loop-police.json)"
+    );
+    assert.equal(cfg.MSG_TOOL_LOOP, "loop!");
+  });
+});
+
+describe("fmt (message template interpolation)", () => {
+  test("fills a single placeholder", () => {
+    assert.equal(fmt("read {count} times", { count: 4 }), "read 4 times");
+  });
+
+  test("fills multiple distinct placeholders", () => {
+    assert.equal(
+      fmt('"{path}" read {count}x', { path: "/a", count: 3 }),
+      '"/a" read 3x',
+    );
+  });
+
+  test("same placeholder repeated is filled each time", () => {
+    assert.equal(fmt("{count}/{count}", { count: 2 }), "2/2");
+  });
+
+  test("unknown placeholder is left verbatim (visible typo)", () => {
+    assert.equal(fmt("hi {nope}", { count: 1 }), "hi {nope}");
+  });
+
+  test("no placeholders → returned unchanged", () => {
+    assert.equal(fmt("plain message", { count: 1 }), "plain message");
+  });
+
+  test("coerces non-string template to string", () => {
+    assert.equal(fmt(42, {}), "42");
+  });
+
+  test("string values interpolate too", () => {
+    assert.equal(fmt("pattern {pattern}", { pattern: "GL" }), "pattern GL");
   });
 });

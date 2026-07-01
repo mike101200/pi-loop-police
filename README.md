@@ -49,10 +49,11 @@ Before each search tool call (`grep`, `search`, `find`, `glob`, `rg`, etc.), the
 
 ### Tool call sequence loop
 
-Before each tool executes, the extension hashes `toolName + stableStringify(args)` and appends it to a flat history. It then checks whether the last *W* calls are identical to the *W* calls immediately before them. On match:
+Before each tool executes, the extension hashes `toolName + stableStringify(args)` and appends it to a flat history. It then checks whether the last *W* calls are identical to the *W* calls immediately before them. On match, the repeated call is **blocked in place** — it does not run, and the recovery message is handed straight back as that tool's result, in the same turn. No new turn is started, and other (different) tools stay available, so the model is forced to pivot immediately instead of re-issuing the same call.
 
-- The repeated call is blocked (`{ block: true }`).
-- A recovery message is injected explaining that the sequence is repeating and asking the model to reconsider.
+Because detection requires *adjacent* repetition, an interleaved different action breaks it: `build → edit → build` does not trip, so legitimate re-runs after real changes are fine. As long as the model keeps repeating the identical call back-to-back, it keeps getting blocked.
+
+Set `TOOL_LOOP_BAN: 1` to make blocks **permanent per call**: once a specific call loops, that exact call stays blocked for the rest of the session no matter what (stronger against stubborn models, but it will also block legitimate later re-runs of the same command).
 
 Detection is exact — only identical repetitions trigger it, not similar ones.
 
@@ -84,9 +85,28 @@ STAGNATION_WINDOW: 4        // turns of similar thinking → stagnation
 STAGNATION_THRESHOLD: 0.85  // Jaccard similarity threshold for stagnation
 FILE_READ_LIMIT: 4          // reads of same file path before blocking
 SEARCH_EXPAND_LIMIT: 3      // unique paths for same search pattern before blocking
+CONSECUTIVE_LOOP_LIMIT: 2   // consecutive looped turns before escalating the message
+TOOL_LOOP_BAN: 0            // 0 = block identical call only while repeated back-to-back
+                            // 1 = ban that exact call for the rest of the session
 ```
 
 Increase `MIN_THINKING_WINDOW` or `PARA_LOOP_THRESHOLD` if you get false positives on thinking loops. Increase `FILE_READ_LIMIT` for projects where legitimately re-reading files is common.
+
+### Customizing recovery messages
+
+The text injected when a loop is detected is configurable — some models respond better to different phrasing. These live alongside the numeric config in `loop-police.json` as `MSG_*` keys:
+
+| Key | Fired when | Placeholders |
+|-----|-----------|--------------|
+| `MSG_THINKING_LOOP` | character-level thinking loop | — |
+| `MSG_SEMANTIC_LOOP` | semantic (paragraph) thinking loop | — |
+| `MSG_CONSECUTIVE_LOOP` | `CONSECUTIVE_LOOP_LIMIT` looped turns in a row | `{count}` |
+| `MSG_STAGNATION` | cross-turn reasoning stagnation | `{window}` `{threshold}` |
+| `MSG_FILE_READ_LOOP` | same file read too many times | `{path}` `{count}` |
+| `MSG_SEARCH_SPIRAL` | search pattern spread across too many paths | `{pattern}` `{paths}` |
+| `MSG_TOOL_LOOP` | identical tool-call sequence repeating | `{windowSize}` |
+
+`{placeholder}` tokens are substituted at runtime; unknown tokens are left as-is so a typo stays visible. Messages are edited in `loop-police.json` only — `/loop-police set` handles numeric keys and will refuse a `MSG_*` key.
 
 ## Compatibility
 

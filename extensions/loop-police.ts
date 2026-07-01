@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(EXT_DIR, "loop-police.json");
 
-const DEFAULTS = {
+const NUMERIC_DEFAULTS = {
   MIN_THINKING_WINDOW: 80,
   MAX_THINKING_WINDOW: 2000,
   CHECK_STRIDE: 50,
@@ -21,22 +21,62 @@ const DEFAULTS = {
   FILE_READ_LIMIT: 4,
   SEARCH_EXPAND_LIMIT: 3,
   CONSECUTIVE_LOOP_LIMIT: 2,
+  TOOL_LOOP_BAN: 0, // 0 = block identical call only while repeated back-to-back;
+  //                   1 = ban that exact call for the rest of the session
 };
 
-const cfg: typeof DEFAULTS & { [key: string]: number } = (() => {
-  // Ensure config file exists with defaults
-  if (!existsSync(CONFIG_PATH)) {
+// Recovery messages injected into the agent when a loop is detected. Edit these
+// in loop-police.json to tune the wording per model — some models respond
+// better to different phrasing. Placeholders in {braces} are filled at runtime:
+//   MSG_CONSECUTIVE_LOOP → {count}
+//   MSG_STAGNATION       → {window} {threshold}
+//   MSG_FILE_READ_LOOP   → {path} {count}
+//   MSG_SEARCH_SPIRAL    → {pattern} {paths}
+//   MSG_TOOL_LOOP        → {windowSize}
+const MESSAGE_DEFAULTS = {
+  MSG_THINKING_LOOP:
+    "⚠️ THINKING LOOP DETECTED: Your thinking block was repeating the same phrases verbatim and has been truncated. Re-examine your approach and continue with the task.",
+  MSG_SEMANTIC_LOOP:
+    "⚠️ SEMANTIC LOOP DETECTED: Your thinking block was cycling through the same reasoning steps repeatedly. The repeated section has been truncated. Step back and try a completely different approach.",
+  MSG_CONSECUTIVE_LOOP:
+    "⚠️ CONSECUTIVE LOOP ({count}x): You have entered a thinking loop {count} times in a row and loop-police has aborted your thinking each time. Stop thinking now — provide a direct answer or ask for clarification.",
+  MSG_STAGNATION:
+    "⚠️ REASONING STAGNATION: Your thinking across the last {window} turns has been {threshold}%+ similar — you are not making progress. Stop and try a fundamentally different approach.",
+  MSG_FILE_READ_LOOP:
+    '⚠️ FILE READ LOOP: "{path}" has been read {count} times. Reading it again will not yield new information — use what you already know and move forward.',
+  MSG_SEARCH_SPIRAL:
+    '⚠️ SEARCH EXPANSION SPIRAL: Pattern "{pattern}" has been searched in {paths} different locations. Broadening the scope further will not help — reconsider what you are looking for.',
+  MSG_TOOL_LOOP:
+    "⚠️ TOOL CALL LOOP: The same sequence of {windowSize} tool call(s) is repeating identically and has been blocked — this exact call did NOT run and will keep being blocked if you repeat it. It produced no new result last time and won't now. Change your approach: try a different command, or use what you already learned to move forward.",
+};
+
+const DEFAULTS = { ...NUMERIC_DEFAULTS, ...MESSAGE_DEFAULTS };
+
+const cfg: typeof DEFAULTS & Record<string, number | string> = (() => {
+  // Read the existing config (null = missing or unreadable/corrupt).
+  let fromFile: Record<string, unknown> | null = null;
+  try {
+    if (existsSync(CONFIG_PATH)) fromFile = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+  } catch {
+    fromFile = null; // corrupt JSON — leave the file untouched, use defaults
+  }
+  const merged = { ...DEFAULTS, ...(fromFile ?? {}) } as typeof DEFAULTS &
+    Record<string, number | string>;
+
+  // Write the file when it is absent, or backfill it when an upgrade added new
+  // keys the on-disk file is missing — so users can discover and edit them.
+  // Never overwrite a file that failed to parse (fromFile === null && exists).
+  const fileExists = existsSync(CONFIG_PATH);
+  const backfillNeeded =
+    fromFile !== null && Object.keys(DEFAULTS).some((k) => !(k in fromFile));
+  if (!fileExists || backfillNeeded) {
     try {
-      writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2) + "\n", "utf-8");
+      writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n", "utf-8");
     } catch {
       // If we can't write (e.g. permissions), just use defaults in memory
     }
   }
-  try {
-    return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) };
-  } catch {
-    return { ...DEFAULTS };
-  }
+  return merged;
 })();
 
 export default function (pi: ExtensionAPI) {
@@ -45,7 +85,7 @@ export default function (pi: ExtensionAPI) {
   let lastCheckedLen = 0;
   let loopType: "character" | "semantic" = "character";
   let toolHistory: string[] = [];
-  let toolLoopTriggered = false;
+  let bannedCalls = new Set<string>();
   let thinkingHistory: string[] = [];
   let fileReadCounts = new Map<string, number>();
   let searchPatternPaths = new Map<string, Set<string>>();
@@ -57,7 +97,7 @@ export default function (pi: ExtensionAPI) {
     lastCheckedLen = 0;
     loopType = "character";
     toolHistory = [];
-    toolLoopTriggered = false;
+    bannedCalls = new Set();
     thinkingHistory = [];
     fileReadCounts = new Map();
     searchPatternPaths = new Map();
@@ -71,8 +111,10 @@ export default function (pi: ExtensionAPI) {
     thinkingAborted = false;
     cleanThinkingPrefix = null;
     loopType = "character";
-    toolLoopTriggered = false; // allow recovery turns to use tools
-    consecutiveLoopCount = 0; // reset per turn
+    // NOTE: consecutiveLoopCount is intentionally NOT reset here. Recovery
+    // turns fire turn_start, so resetting would defeat cross-turn escalation.
+    // It is cleared on a clean (non-aborted) turn in message_end instead.
+    // toolHistory / bannedCalls also persist across turns (reset on agent_start).
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -94,20 +136,8 @@ export default function (pi: ExtensionAPI) {
     thinkingAborted = true;
     cleanThinkingPrefix = repeat.cleanPrefix;
     consecutiveLoopCount++;
-
-    if (consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT) {
-      ctx.abort();
-      pi.sendMessage(
-        {
-          customType: "loop-police",
-          content: `⚠️ CONSECUTIVE LOOP (${consecutiveLoopCount}x): You have entered a thinking loop ${consecutiveLoopCount} times in a row. Loop-police has aborted your thinking ${consecutiveLoopCount} time(s). Stop thinking and provide a direct answer or ask for clarification.`,
-          display: true,
-        },
-        { triggerTurn: true }
-      );
-      return;
-    }
-
+    // Only abort here; message_end decides which recovery message to send
+    // (escalated vs. normal) so a single turn is triggered, not two.
     ctx.abort();
   });
 
@@ -124,9 +154,12 @@ export default function (pi: ExtensionAPI) {
       const label = isSemantic
         ? "[SEMANTIC LOOP — truncated by loop-police]"
         : "[THINKING LOOP — truncated by loop-police]";
-      const advice = isSemantic
-        ? "⚠️ SEMANTIC LOOP DETECTED: Your thinking block was cycling through the same reasoning steps repeatedly. The repeated section has been truncated. Step back and try a completely different approach."
-        : "⚠️ THINKING LOOP DETECTED: Your thinking block was repeating the same phrases verbatim and has been truncated. Re-examine your approach and continue with the task.";
+      const advice =
+        consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT
+          ? fmt(cfg.MSG_CONSECUTIVE_LOOP, { count: consecutiveLoopCount })
+          : isSemantic
+            ? String(cfg.MSG_SEMANTIC_LOOP)
+            : String(cfg.MSG_THINKING_LOOP);
 
       const cleaned = replaceThinking(event.message, `${prefix}\n\n${label}`);
       pi.sendMessage(
@@ -135,6 +168,10 @@ export default function (pi: ExtensionAPI) {
       );
       return { message: cleaned };
     }
+
+    // Clean turn — the model produced a non-looping thinking block, so it is
+    // making progress. Clear the consecutive-loop escalation counter.
+    consecutiveLoopCount = 0;
 
     // Cross-turn stagnation: only run on clean (non-aborted) turns
     const thinking = extractThinking(event.message);
@@ -151,7 +188,10 @@ export default function (pi: ExtensionAPI) {
           pi.sendMessage(
             {
               customType: "loop-police",
-              content: `⚠️ REASONING STAGNATION: Your thinking across the last ${cfg.STAGNATION_WINDOW} turns has been ${Math.round(cfg.STAGNATION_THRESHOLD * 100)}%+ similar — you are not making progress. Stop and try a fundamentally different approach.`,
+              content: fmt(cfg.MSG_STAGNATION, {
+                window: cfg.STAGNATION_WINDOW,
+                threshold: Math.round(cfg.STAGNATION_THRESHOLD * 100),
+              }),
               display: true,
             },
             { triggerTurn: true }
@@ -173,7 +213,7 @@ export default function (pi: ExtensionAPI) {
           pi.sendMessage(
             {
               customType: "loop-police",
-              content: `⚠️ FILE READ LOOP: "${path}" has been read ${count} times. Reading it again will not yield new information — use what you already know and move forward.`,
+              content: fmt(cfg.MSG_FILE_READ_LOOP, { path, count }),
               display: true,
             },
             { triggerTurn: true }
@@ -196,7 +236,7 @@ export default function (pi: ExtensionAPI) {
           pi.sendMessage(
             {
               customType: "loop-police",
-              content: `⚠️ SEARCH EXPANSION SPIRAL: Pattern "${pattern}" has been searched in ${paths.size} different locations. Broadening the scope further will not help — reconsider what you are looking for.`,
+              content: fmt(cfg.MSG_SEARCH_SPIRAL, { pattern, paths: paths.size }),
               display: true,
             },
             { triggerTurn: true }
@@ -206,27 +246,27 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Tool call sequence loop
-    if (toolLoopTriggered) {
-      return { block: true, reason: "loop-police: still in tool call loop" };
+    // Tool call sequence loop — block the repeated call *in place* and hand the
+    // warning back as the tool result, so the model must pivot within the same
+    // turn. No new turn, and other (different) tools are left available.
+    const hash = hashToolCall(event.toolName, event.input);
+
+    // Permanent-ban mode (TOOL_LOOP_BAN=1): once a call has looped, that exact
+    // call stays blocked for the rest of the session, no matter what.
+    if (cfg.TOOL_LOOP_BAN && bannedCalls.has(hash)) {
+      ctx.ui.notify(`⚠️ TOOL LOOP: identical call blocked (banned)`, "warning");
+      return { block: true, reason: fmt(cfg.MSG_TOOL_LOOP, { windowSize: 1 }) };
     }
 
-    const hash = hashToolCall(event.toolName, event.input);
-    const candidate = [...toolHistory, hash];
-    const windowSize = detectSequenceRepeat(candidate);
-
+    const windowSize = detectSequenceRepeat([...toolHistory, hash]);
     if (windowSize > 0) {
-      toolLoopTriggered = true;
+      if (cfg.TOOL_LOOP_BAN) bannedCalls.add(hash);
       ctx.ui.notify(`⚠️ TOOL LOOP: ${windowSize}-call sequence repeating — blocked`, "warning");
-      pi.sendMessage(
-        {
-          customType: "loop-police",
-          content: `⚠️ TOOL CALL LOOP: The same sequence of ${windowSize} tool call(s) is repeating identically. The repeated call has been blocked — your current strategy is not working, reconsider your approach entirely.`,
-          display: true,
-        },
-        { triggerTurn: true }
-      );
-      return { block: true, reason: `loop-police: ${windowSize}-call sequence repeating` };
+      // Do NOT record the blocked call: toolHistory stays at the looping state
+      // so a renewed identical attempt trips the detector again in place. The
+      // moment the model does something different, adjacency breaks and the
+      // call is allowed again (safe for build/test/lint re-runs).
+      return { block: true, reason: fmt(cfg.MSG_TOOL_LOOP, { windowSize }) };
     }
 
     toolHistory.push(hash);
@@ -244,18 +284,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (trimmed.startsWith("set ")) {
-        const results: string[] = [];
-        for (const pair of trimmed.slice(4).trim().split(/\s+/)) {
-          const eq = pair.indexOf("=");
-          const key = pair.slice(0, eq);
-          const val = pair.slice(eq + 1);
-          if (eq > 0 && key in cfg && val !== "") {
-            (cfg as any)[key] = parseFloat(val);
-            results.push(`${key}=${(cfg as any)[key]}`);
-          } else {
-            results.push(`unknown: ${key}`);
-          }
-        }
+        const results = trimmed
+          .slice(4)
+          .trim()
+          .split(/\s+/)
+          .map((pair) => setConfigValue(cfg, pair));
         ctx.ui.notify(`Loop Police: ${results.join(", ")}`, "info");
         return;
       }
@@ -265,14 +298,17 @@ export default function (pi: ExtensionAPI) {
           "Loop Police status",
           `  thinking aborted:    ${thinkingAborted}`,
           `  tool history:        ${toolHistory.length} calls`,
-          `  tool loop triggered: ${toolLoopTriggered}`,
+          `  banned calls:        ${bannedCalls.size}`,
           `  stagnation history:  ${thinkingHistory.length}/${cfg.STAGNATION_WINDOW} turns`,
           `  file reads tracked:  ${fileReadCounts.size} paths`,
           `  search patterns:     ${searchPatternPaths.size} patterns`,
           `  consecutive loops:   ${consecutiveLoopCount}/${cfg.CONSECUTIVE_LOOP_LIMIT}`,
           "",
           "  config (set KEY=VAL to change):",
-          ...Object.entries(cfg).map(([k, v]) => `    ${k}=${v}`),
+          ...Object.keys(NUMERIC_DEFAULTS).map((k) => `    ${k}=${cfg[k]}`),
+          "",
+          "  messages (edit loop-police.json to customize):",
+          ...Object.keys(MESSAGE_DEFAULTS).map((k) => `    ${k}`),
         ].join("\n"),
         "info"
       );
@@ -285,6 +321,34 @@ export default function (pi: ExtensionAPI) {
 }
 
 // helpers
+
+// Fill {placeholder} tokens in a message template. Unknown tokens are left as-is
+// so a typo in a user-edited template is visible rather than silently dropped.
+function fmt(template: string | number, vars: Record<string, string | number>): string {
+  return String(template).replace(/\{(\w+)\}/g, (whole, key) =>
+    key in vars ? String(vars[key]) : whole
+  );
+}
+
+// Parse and apply a single "KEY=VAL" assignment against `target`, mutating it
+// on success. Returns a human-readable status string for the notification.
+// Rejects unknown keys and non-finite values (e.g. "3px", "", "abc") so a bad
+// input never silently writes NaN into a threshold and disables a detector.
+// Message templates (MSG_*) are string-valued and thus rejected here by design —
+// they are edited in loop-police.json, not via /loop-police set.
+function setConfigValue(target: Record<string, number | string>, pair: string): string {
+  const eq = pair.indexOf("=");
+  if (eq <= 0) return `unknown: ${pair}`;
+  const key = pair.slice(0, eq);
+  const val = pair.slice(eq + 1);
+  if (!(key in target)) return `unknown: ${key}`;
+  // Only numeric config is settable here; string templates are JSON-only.
+  if (typeof target[key] === "string") return `not settable: ${key} (edit loop-police.json)`;
+  const num = Number(val);
+  if (val === "" || !Number.isFinite(num)) return `invalid: ${key}=${val}`;
+  target[key] = num;
+  return `${key}=${num}`;
+}
 
 function jaccard(a: string, b: string): number {
   const setA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));

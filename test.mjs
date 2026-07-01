@@ -99,6 +99,71 @@ function getSearchPattern(input) {
   return input.pattern ?? input.query ?? input.regex ?? input.search ?? input.term ?? null;
 }
 
+const COMMAND_EXCEPTION_LIST = ["wiki-ingest", "LLM-WIKI"];
+
+function isExceptedTool(toolName) {
+  return COMMAND_EXCEPTION_LIST.some(
+    (name) => toolName === name || toolName.toLowerCase() === name.toLowerCase()
+  );
+}
+
+function normalizePath(path) {
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
+function parsePathLineSuffix(path) {
+  const rangeMatch = path.match(/:(\d+)(?:-(\d+))?$/);
+  if (!rangeMatch) return { filePath: path, lineRange: null };
+  const start = rangeMatch[1];
+  const end = rangeMatch[2] ?? start;
+  return {
+    filePath: path.slice(0, rangeMatch.index),
+    lineRange: `${start}-${end}`,
+  };
+}
+
+function getLineRangeFromInput(input) {
+  if (typeof input !== "object" || !input) return null;
+  const start = input.start_line ?? input.line_start ?? input.start ?? input.offset;
+  const end = input.end_line ?? input.line_end ?? input.end;
+  const limit = input.limit;
+  if (start != null && end != null) return `${start}-${end}`;
+  if (start != null && limit != null) {
+    const startNum = Number(start);
+    const limitNum = Number(limit);
+    if (!Number.isNaN(startNum) && !Number.isNaN(limitNum) && limitNum > 0) {
+      return `${startNum}-${startNum + limitNum - 1}`;
+    }
+  }
+  if (start != null) return `${start}-${start}`;
+  return null;
+}
+
+function getFileReadKey(path, input) {
+  const { filePath, lineRange: pathLineRange } = parsePathLineSuffix(path);
+  const inputLineRange = getLineRangeFromInput(input);
+  const lineRange = inputLineRange ?? pathLineRange;
+  const normalized = normalizePath(filePath);
+  return lineRange ? `${normalized}:${lineRange}` : normalized;
+}
+
+function trackFileRead(fileReadCounts, path, input, limit) {
+  const readKey = getFileReadKey(path, input);
+  const count = (fileReadCounts.get(readKey) ?? 0) + 1;
+  fileReadCounts.set(readKey, count);
+  return { readKey, count, blocked: count >= limit };
+}
+
+function trackSequenceCall(sequenceHistory, toolName, input) {
+  if (isExceptedTool(toolName)) return { blocked: false, windowSize: 0 };
+  const hash = hashToolCall(toolName, input);
+  const candidate = [...sequenceHistory, hash];
+  const windowSize = detectSequenceRepeat(candidate);
+  if (windowSize > 0) return { blocked: true, windowSize };
+  sequenceHistory.push(hash);
+  return { blocked: false, windowSize: 0 };
+}
+
 // ponytail: local helper that mirrors the stagnation check in message_end
 function isStagnant(history, window, threshold) {
   if (history.length < window) return false;
@@ -394,6 +459,93 @@ describe("getSearchPattern", () => {
   test("pattern takes precedence over query", () => assert.equal(getSearchPattern({ pattern: "a", query: "b" }), "a"));
   test("empty object → null", () => assert.equal(getSearchPattern({}), null));
   test("null → null", () => assert.equal(getSearchPattern(null), null));
+});
+
+describe("getFileReadKey", () => {
+  const file = "c:/Proiecte/CSharp/TransportFull/Transport/Transport/ViewModels/CursaExtViewModel.cs";
+
+  test("same path with different line suffixes → different keys", () => {
+    const a = getFileReadKey(`${file}:55-114`, {});
+    const b = getFileReadKey(`${file}:115-200`, {});
+    assert.notEqual(a, b);
+    assert.equal(a, `${normalizePath(file)}:55-114`);
+    assert.equal(b, `${normalizePath(file)}:115-200`);
+  });
+
+  test("offset + limit in input → line range key", () => {
+    const key = getFileReadKey(file, { path: file, offset: 55, limit: 60 });
+    assert.equal(key, `${normalizePath(file)}:55-114`);
+  });
+
+  test("start_line + end_line in input", () => {
+    const key = getFileReadKey(file, { path: file, start_line: 115, end_line: 200 });
+    assert.equal(key, `${normalizePath(file)}:115-200`);
+  });
+
+  test("full file read without line range", () => {
+    const key = getFileReadKey(file, { path: file });
+    assert.equal(key, normalizePath(file));
+  });
+
+  test("same line range read repeatedly shares one counter", () => {
+    const counts = new Map();
+    const input = { path: `${file}:55-114` };
+    const limit = 4;
+    for (let i = 1; i <= limit; i++) {
+      const { count, blocked } = trackFileRead(counts, input.path, input, limit);
+      assert.equal(count, i);
+      assert.equal(blocked, i >= limit);
+    }
+    assert.equal(counts.size, 1);
+  });
+
+  test("different line ranges of same file have separate counters", () => {
+    const counts = new Map();
+    trackFileRead(counts, `${file}:55-114`, {}, 4);
+    trackFileRead(counts, `${file}:115-200`, {}, 4);
+    assert.equal(counts.size, 2);
+  });
+
+  test("path normalization: backslashes and case", () => {
+    const a = getFileReadKey("C:\\Foo\\Bar.cs:10-20", {});
+    const b = getFileReadKey("c:/foo/bar.cs:10-20", {});
+    assert.equal(a, b);
+  });
+});
+
+describe("isExceptedTool", () => {
+  test("wiki-ingest is excepted", () => assert.ok(isExceptedTool("wiki-ingest")));
+  test("LLM-WIKI is excepted", () => assert.ok(isExceptedTool("LLM-WIKI")));
+  test("case insensitive match", () => assert.ok(isExceptedTool("Wiki-Ingest")));
+  test("read is not excepted", () => assert.ok(!isExceptedTool("read")));
+});
+
+describe("COMMAND_EXCEPTION_LIST sequence tracking", () => {
+  test("repeated excepted tool does not trigger sequence loop", () => {
+    const history = [];
+    for (let i = 0; i < 6; i++) {
+      const result = trackSequenceCall(history, "wiki-ingest", { source: `doc-${i}` });
+      assert.ok(!result.blocked);
+    }
+    assert.equal(history.length, 0);
+  });
+
+  test("repeated non-excepted tool still triggers sequence loop", () => {
+    const history = [];
+    trackSequenceCall(history, "read", { path: "/foo" });
+    const result = trackSequenceCall(history, "read", { path: "/foo" });
+    assert.ok(result.blocked);
+    assert.equal(result.windowSize, 1);
+  });
+
+  test("excepted tool between reads does not pollute sequence history", () => {
+    const history = [];
+    trackSequenceCall(history, "read", { path: "/foo" });
+    trackSequenceCall(history, "wiki-ingest", { source: "a" });
+    const result = trackSequenceCall(history, "read", { path: "/foo" });
+    assert.ok(result.blocked);
+    assert.equal(result.windowSize, 1);
+  });
 });
 
 describe("stagnation detection", () => {

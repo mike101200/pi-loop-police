@@ -10,6 +10,7 @@ const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(EXT_DIR, "loop-police.json");
 
 const DEFAULTS = {
+  ENABLED: true,
   MIN_THINKING_WINDOW: 80,
   MAX_THINKING_WINDOW: 2000,
   CHECK_STRIDE: 50,
@@ -21,10 +22,27 @@ const DEFAULTS = {
   FILE_READ_LIMIT: 4,
   SEARCH_EXPAND_LIMIT: 3,
   CONSECUTIVE_LOOP_LIMIT: 2,
+  COMMAND_EXCEPTION_LIST: ["wiki-ingest", "LLM-WIKI"],
 };
 
-const cfg: typeof DEFAULTS & { [key: string]: number } = (() => {
-  // Ensure config file exists with defaults
+type LoopPoliceConfig = typeof DEFAULTS;
+
+function parseConfigValue(key: string, val: string): unknown {
+  if (key === "ENABLED") return val === "true" || val === "1";
+  if (key === "COMMAND_EXCEPTION_LIST") {
+    return val.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  const num = parseFloat(val);
+  return Number.isNaN(num) ? val : num;
+}
+
+function formatConfigValue(key: string, val: unknown): string {
+  if (key === "ENABLED") return String(val);
+  if (key === "COMMAND_EXCEPTION_LIST") return (val as string[]).join(",");
+  return String(val);
+}
+
+function loadConfig(): LoopPoliceConfig {
   if (!existsSync(CONFIG_PATH)) {
     try {
       writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2) + "\n", "utf-8");
@@ -33,11 +51,25 @@ const cfg: typeof DEFAULTS & { [key: string]: number } = (() => {
     }
   }
   try {
-    return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) };
+    const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Partial<LoopPoliceConfig>;
+    return {
+      ...DEFAULTS,
+      ...parsed,
+      ENABLED: parsed.ENABLED !== undefined ? Boolean(parsed.ENABLED) : DEFAULTS.ENABLED,
+      COMMAND_EXCEPTION_LIST: Array.isArray(parsed.COMMAND_EXCEPTION_LIST)
+        ? parsed.COMMAND_EXCEPTION_LIST
+        : DEFAULTS.COMMAND_EXCEPTION_LIST,
+    };
   } catch {
     return { ...DEFAULTS };
   }
-})();
+}
+
+const cfg: LoopPoliceConfig = loadConfig();
+
+function isEnabled(): boolean {
+  return cfg.ENABLED;
+}
 
 export default function (pi: ExtensionAPI) {
   let thinkingAborted = false;
@@ -45,6 +77,7 @@ export default function (pi: ExtensionAPI) {
   let lastCheckedLen = 0;
   let loopType: "character" | "semantic" = "character";
   let toolHistory: string[] = [];
+  let sequenceHistory: string[] = [];
   let toolLoopTriggered = false;
   let thinkingHistory: string[] = [];
   let fileReadCounts = new Map<string, number>();
@@ -57,6 +90,7 @@ export default function (pi: ExtensionAPI) {
     lastCheckedLen = 0;
     loopType = "character";
     toolHistory = [];
+    sequenceHistory = [];
     toolLoopTriggered = false;
     thinkingHistory = [];
     fileReadCounts = new Map();
@@ -76,7 +110,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_update", (event, ctx) => {
-    if (thinkingAborted || event.message.role !== "assistant") return;
+    if (!isEnabled() || thinkingAborted || event.message.role !== "assistant") return;
     const thinking = extractThinking(event.message);
     if (!thinking || thinking.length < lastCheckedLen + cfg.CHECK_STRIDE) return;
     lastCheckedLen = thinking.length;
@@ -112,7 +146,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", (event, _ctx) => {
-    if (event.message.role !== "assistant") return;
+    if (!isEnabled() || event.message.role !== "assistant") return;
 
     if (thinkingAborted) {
       const prefix = cleanThinkingPrefix ?? "";
@@ -162,23 +196,28 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", (event, ctx) => {
+    if (!isEnabled()) return;
+
+    const excepted = isExceptedTool(event.toolName);
+
     // File read repetition
     if (isReadTool(event.toolName)) {
       const path = getInputPath(event.input);
       if (path) {
-        const count = (fileReadCounts.get(path) ?? 0) + 1;
-        fileReadCounts.set(path, count);
+        const readKey = getFileReadKey(path, event.input);
+        const count = (fileReadCounts.get(readKey) ?? 0) + 1;
+        fileReadCounts.set(readKey, count);
         if (count >= cfg.FILE_READ_LIMIT) {
-          ctx.ui.notify(`⚠️ FILE READ LOOP: "${path}" read ${count}x — blocked`, "warning");
+          ctx.ui.notify(`⚠️ FILE READ LOOP: "${readKey}" read ${count}x — blocked`, "warning");
           pi.sendMessage(
             {
               customType: "loop-police",
-              content: `⚠️ FILE READ LOOP: "${path}" has been read ${count} times. Reading it again will not yield new information — use what you already know and move forward.`,
+              content: `⚠️ FILE READ LOOP: "${readKey}" has been read ${count} times. Reading it again will not yield new information — use what you already know and move forward.`,
               display: true,
             },
             { triggerTurn: true }
           );
-          return { block: true, reason: `loop-police: file read ${count}x — ${path}` };
+          return { block: true, reason: `loop-police: file read ${count}x — ${readKey}` };
         }
       }
     }
@@ -206,30 +245,34 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Tool call sequence loop
-    if (toolLoopTriggered) {
+    // Tool call sequence loop (excepted tools may repeat, e.g. wiki-ingest)
+    if (toolLoopTriggered && !excepted) {
       return { block: true, reason: "loop-police: still in tool call loop" };
     }
 
     const hash = hashToolCall(event.toolName, event.input);
-    const candidate = [...toolHistory, hash];
-    const windowSize = detectSequenceRepeat(candidate);
-
-    if (windowSize > 0) {
-      toolLoopTriggered = true;
-      ctx.ui.notify(`⚠️ TOOL LOOP: ${windowSize}-call sequence repeating — blocked`, "warning");
-      pi.sendMessage(
-        {
-          customType: "loop-police",
-          content: `⚠️ TOOL CALL LOOP: The same sequence of ${windowSize} tool call(s) is repeating identically. The repeated call has been blocked — your current strategy is not working, reconsider your approach entirely.`,
-          display: true,
-        },
-        { triggerTurn: true }
-      );
-      return { block: true, reason: `loop-police: ${windowSize}-call sequence repeating` };
-    }
-
     toolHistory.push(hash);
+
+    if (!excepted) {
+      const candidate = [...sequenceHistory, hash];
+      const windowSize = detectSequenceRepeat(candidate);
+
+      if (windowSize > 0) {
+        toolLoopTriggered = true;
+        ctx.ui.notify(`⚠️ TOOL LOOP: ${windowSize}-call sequence repeating — blocked`, "warning");
+        pi.sendMessage(
+          {
+            customType: "loop-police",
+            content: `⚠️ TOOL CALL LOOP: The same sequence of ${windowSize} tool call(s) is repeating identically. The repeated call has been blocked — your current strategy is not working, reconsider your approach entirely.`,
+            display: true,
+          },
+          { triggerTurn: true }
+        );
+        return { block: true, reason: `loop-police: ${windowSize}-call sequence repeating` };
+      }
+
+      sequenceHistory.push(hash);
+    }
   });
 
   pi.registerCommand("loop-police", {
@@ -250,8 +293,8 @@ export default function (pi: ExtensionAPI) {
           const key = pair.slice(0, eq);
           const val = pair.slice(eq + 1);
           if (eq > 0 && key in cfg && val !== "") {
-            (cfg as any)[key] = parseFloat(val);
-            results.push(`${key}=${(cfg as any)[key]}`);
+            (cfg as Record<string, unknown>)[key] = parseConfigValue(key, val);
+            results.push(`${key}=${formatConfigValue(key, (cfg as Record<string, unknown>)[key])}`);
           } else {
             results.push(`unknown: ${key}`);
           }
@@ -263,16 +306,18 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(
         [
           "Loop Police status",
+          `  enabled:             ${isEnabled()}`,
           `  thinking aborted:    ${thinkingAborted}`,
           `  tool history:        ${toolHistory.length} calls`,
+          `  sequence history:    ${sequenceHistory.length} calls`,
           `  tool loop triggered: ${toolLoopTriggered}`,
           `  stagnation history:  ${thinkingHistory.length}/${cfg.STAGNATION_WINDOW} turns`,
-          `  file reads tracked:  ${fileReadCounts.size} paths`,
+          `  file reads tracked:  ${fileReadCounts.size} keys`,
           `  search patterns:     ${searchPatternPaths.size} patterns`,
           `  consecutive loops:   ${consecutiveLoopCount}/${cfg.CONSECUTIVE_LOOP_LIMIT}`,
           "",
           "  config (set KEY=VAL to change):",
-          ...Object.entries(cfg).map(([k, v]) => `    ${k}=${v}`),
+          ...Object.entries(cfg).map(([k, v]) => `    ${k}=${formatConfigValue(k, v)}`),
         ].join("\n"),
         "info"
       );
@@ -307,6 +352,55 @@ function getInputPath(input: unknown): string | null {
   if (typeof input !== "object" || !input) return null;
   const inp = input as any;
   return inp.path ?? inp.file_path ?? inp.filename ?? inp.file ?? inp.directory ?? inp.dir ?? null;
+}
+
+function isExceptedTool(toolName: string): boolean {
+  return cfg.COMMAND_EXCEPTION_LIST.some(
+    (name) => toolName === name || toolName.toLowerCase() === name.toLowerCase()
+  );
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
+}
+
+function parsePathLineSuffix(path: string): { filePath: string; lineRange: string | null } {
+  const rangeMatch = path.match(/:(\d+)(?:-(\d+))?$/);
+  if (!rangeMatch) return { filePath: path, lineRange: null };
+  const start = rangeMatch[1];
+  const end = rangeMatch[2] ?? start;
+  return {
+    filePath: path.slice(0, rangeMatch.index),
+    lineRange: `${start}-${end}`,
+  };
+}
+
+function getLineRangeFromInput(input: unknown): string | null {
+  if (typeof input !== "object" || !input) return null;
+  const inp = input as Record<string, unknown>;
+
+  const start = inp.start_line ?? inp.line_start ?? inp.start ?? inp.offset;
+  const end = inp.end_line ?? inp.line_end ?? inp.end;
+  const limit = inp.limit;
+
+  if (start != null && end != null) return `${start}-${end}`;
+  if (start != null && limit != null) {
+    const startNum = Number(start);
+    const limitNum = Number(limit);
+    if (!Number.isNaN(startNum) && !Number.isNaN(limitNum) && limitNum > 0) {
+      return `${startNum}-${startNum + limitNum - 1}`;
+    }
+  }
+  if (start != null) return `${start}-${start}`;
+  return null;
+}
+
+function getFileReadKey(path: string, input: unknown): string {
+  const { filePath, lineRange: pathLineRange } = parsePathLineSuffix(path);
+  const inputLineRange = getLineRangeFromInput(input);
+  const lineRange = inputLineRange ?? pathLineRange;
+  const normalized = normalizePath(filePath);
+  return lineRange ? `${normalized}:${lineRange}` : normalized;
 }
 
 function getSearchPattern(input: unknown): string | null {

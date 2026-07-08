@@ -377,7 +377,6 @@ export default function (pi: ExtensionAPI) {
     if (quality.curr) {
       lastPromptFingerprints = quality.curr;
     }
-    }
 
     if (quality.count && quality.reason) {
       await recordPersistFailure(quality.reason, ctx);

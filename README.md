@@ -1,5 +1,8 @@
 # pi-loop-police
 
+[![test](https://github.com/sebaxzero/pi-loop-police/actions/workflows/test.yml/badge.svg)](https://github.com/sebaxzero/pi-loop-police/actions/workflows/test.yml)
+[![npm](https://img.shields.io/npm/v/pi-loop-police)](https://www.npmjs.com/package/pi-loop-police)
+
 A [pi](https://pi.dev) extension that detects and breaks infinite loops in real time — before they waste your context window.
 
 Small reasoning models (Qwen, DeepSeek, etc.) are prone to several failure modes:
@@ -12,15 +15,19 @@ Loop Police catches these **mid-stream** where possible, aborts or blocks the lo
 
 ## Install
 
+From npm:
+
+```bash
+pi install npm:pi-loop-police
+```
+
+Or from git:
+
 ```bash
 pi install git:github.com/sebaxzero/pi-loop-police.git
 ```
 
-Or install project-locally (adds to `.pi/settings.json` only):
-
-```bash
-pi install git:github.com/sebaxzero/pi-loop-police.git -l
-```
+Add `-l` to either form to install project-locally (adds to `.pi/settings.json` only).
 
 ## How it works
 
@@ -59,7 +66,11 @@ Before each search tool call (`grep`, `search`, `find`, `glob`, `rg`, etc.), the
 
 ### Tool call sequence loop
 
-Before each tool executes, the extension hashes `toolName + stableStringify(args)` and checks whether the last *W* calls are identical to the *W* calls immediately before them. On match, the repeated call is blocked and a recovery message is injected.
+Before each tool executes, the extension hashes `toolName + stableStringify(args)` and appends it to a flat history. It then checks whether the last *W* calls are identical to the *W* calls immediately before them. On match, the repeated call is **blocked in place** — it does not run, and the recovery message is handed straight back as that tool's result, in the same turn. No new turn is started, and other (different) tools stay available, so the model is forced to pivot immediately instead of re-issuing the same call.
+
+Because detection requires *adjacent* repetition, an interleaved different action breaks it: `build → edit → build` does not trip, so legitimate re-runs after real changes are fine. As long as the model keeps repeating the identical call back-to-back, it keeps getting blocked.
+
+Set `TOOL_LOOP_BAN: 1` to make blocks **permanent per call**: once a specific call loops, that exact call stays blocked for the rest of the session no matter what (stronger against stubborn models, but it will also block legitimate later re-runs of the same command).
 
 Detection is exact — only identical repetitions trigger it, not similar ones.
 
@@ -165,6 +176,8 @@ FILE_READ_LIMIT: 4                // reads of same file + line range before bloc
 SEARCH_EXPAND_LIMIT: 3            // unique paths for same search pattern before blocking
 CONSECUTIVE_LOOP_LIMIT: 2          // thinking loops in a row before hard abort
 COMMAND_EXCEPTION_LIST: []         // tools exempt from sequence-loop detection (empty by default)
+TOOL_LOOP_BAN: 0                   // 0 = block identical call only while repeated back-to-back
+                                   // 1 = ban that exact call for the rest of the session
 MODEL_RELOAD_ENABLED: true        // reload llama.cpp model after persistent failures
 MODEL_RELOAD_THRESHOLD: 3         // persistent failures before model reload
 MODEL_RELOAD_COOLDOWN_MS: 120000  // min ms between reload attempts (2 min)
@@ -201,6 +214,22 @@ Exempt `wiki-ingest` from tool-sequence loop detection (iterative wiki ingestion
 - Add tool names to `COMMAND_EXCEPTION_LIST` for commands that must repeat (e.g. wiki ingestion).
 - Raise `MODEL_RELOAD_THRESHOLD` or `MODEL_RELOAD_COOLDOWN_MS` if reloads fire too aggressively on local models.
 
+### Customizing recovery messages
+
+The text injected when a loop is detected is configurable — some models respond better to different phrasing. These live alongside the numeric config in `loop-police.json` as `MSG_*` keys:
+
+| Key | Fired when | Placeholders |
+|-----|-----------|--------------|
+| `MSG_THINKING_LOOP` | character-level thinking loop | — |
+| `MSG_SEMANTIC_LOOP` | semantic (paragraph) thinking loop | — |
+| `MSG_CONSECUTIVE_LOOP` | `CONSECUTIVE_LOOP_LIMIT` looped turns in a row | `{count}` |
+| `MSG_STAGNATION` | cross-turn reasoning stagnation | `{window}` `{threshold}` |
+| `MSG_FILE_READ_LOOP` | same file read too many times | `{path}` `{count}` |
+| `MSG_SEARCH_SPIRAL` | search pattern spread across too many paths | `{pattern}` `{paths}` |
+| `MSG_TOOL_LOOP` | identical tool-call sequence repeating | `{windowSize}` |
+
+`{placeholder}` tokens are substituted at runtime; unknown tokens are left as-is so a typo stays visible. Messages are edited in `loop-police.json` only — `/loop-police set` handles numeric keys and will refuse a `MSG_*` key.
+
 ## Compatibility
 
 Designed for OpenAI-compatible reasoning models (Qwen3, DeepSeek-R1, etc.) used via pi. Pi normalizes provider thinking formats to `{ type: "thinking", thinking: string }` content blocks.
@@ -208,6 +237,20 @@ Designed for OpenAI-compatible reasoning models (Qwen3, DeepSeek-R1, etc.) used 
 Works with local [llama.cpp](https://github.com/ggml-org/llama.cpp) servers (Docker or bare install) and optionally alongside [pi-llama-cpp](https://github.com/gsanhueza/pi-llama-cpp) for model browsing — loop-police only connects to the server when a reload is actually needed.
 
 Works alongside [pi-canary](https://github.com/sebaxzero/pi-canary), which silently verifies agent context awareness using hidden canary tokens. When loop-police aborts a turn, pi-canary yields gracefully and does not fire its own recovery.
+
+## Tests
+
+```bash
+node --test test.mjs
+```
+
+All detectors' pure logic is covered by a dependency-free suite — no build
+step, plain Node. CI runs it on every push and pull request.
+
+## Releasing
+
+Bump `version` in `package.json`, commit, tag `vX.Y.Z`, and push the tag —
+the publish workflow runs the tests and publishes to npm.
 
 ## License
 

@@ -99,6 +99,13 @@ function setConfigValue(target, pair) {
   return `${key}=${num}`;
 }
 
+function migrateToolLoopBan(fromFile) {
+  if (!fromFile || fromFile.CONFIG_VERSION !== undefined) return null;
+  const old = fromFile.TOOL_LOOP_BAN;
+  if (old !== 0 && old !== 1) return null;
+  return old + 1;
+}
+
 function fmt(template, vars) {
   return String(template).replace(/\{(\w+)\}/g, (whole, key) =>
     key in vars ? String(vars[key]) : whole
@@ -538,6 +545,34 @@ describe("setConfigValue", () => {
       "not settable: MSG_TOOL_LOOP (edit loop-police.json)"
     );
     assert.equal(cfg.MSG_TOOL_LOOP, "loop!");
+  });
+});
+
+describe("migrateToolLoopBan (pre-1.5.0 config migration)", () => {
+  test("old temporary (0) → new temporary (1)", () => {
+    assert.equal(migrateToolLoopBan({ TOOL_LOOP_BAN: 0 }), 1);
+  });
+
+  test("old permanent (1) → new permanent (2)", () => {
+    assert.equal(migrateToolLoopBan({ TOOL_LOOP_BAN: 1 }), 2);
+  });
+
+  test("stamped file (any CONFIG_VERSION) is never migrated", () => {
+    assert.equal(migrateToolLoopBan({ CONFIG_VERSION: 2, TOOL_LOOP_BAN: 0 }), null);
+    assert.equal(migrateToolLoopBan({ CONFIG_VERSION: 1, TOOL_LOOP_BAN: 1 }), null);
+  });
+
+  test("missing TOOL_LOOP_BAN → no migration (new default applies)", () => {
+    assert.equal(migrateToolLoopBan({ FILE_READ_LIMIT: 6 }), null);
+  });
+
+  test("missing/corrupt file (null) → no migration", () => {
+    assert.equal(migrateToolLoopBan(null), null);
+  });
+
+  test("values outside the old scale are left alone", () => {
+    assert.equal(migrateToolLoopBan({ TOOL_LOOP_BAN: 2 }), null);
+    assert.equal(migrateToolLoopBan({ TOOL_LOOP_BAN: "1" }), null);
   });
 });
 

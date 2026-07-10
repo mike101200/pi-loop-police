@@ -61,6 +61,10 @@ const MESSAGE_DEFAULTS = {
 
 const DEFAULTS = { ...NUMERIC_DEFAULTS, ...MESSAGE_DEFAULTS };
 
+// Stamped into loop-police.json. Files written before 1.5.0 lack it, which is
+// how migrateToolLoopBan() recognizes the old TOOL_LOOP_BAN scale.
+const CONFIG_VERSION = 2;
+
 const cfg: typeof DEFAULTS & Record<string, number | string> = (() => {
   // Read the existing config (null = missing or unreadable/corrupt).
   let fromFile: Record<string, unknown> | null = null;
@@ -72,13 +76,22 @@ const cfg: typeof DEFAULTS & Record<string, number | string> = (() => {
   const merged = { ...DEFAULTS, ...(fromFile ?? {}) } as typeof DEFAULTS &
     Record<string, number | string>;
 
+  // Pre-1.5.0 configs used a shifted TOOL_LOOP_BAN scale (0 = temporary,
+  // 1 = permanent); 1.5.0 inserted 0 = off below it. Bump the stored value by
+  // one so the old behavior is preserved, then stamp the file so this runs
+  // exactly once.
+  const migratedBan = migrateToolLoopBan(fromFile);
+  if (migratedBan !== null) merged.TOOL_LOOP_BAN = migratedBan;
+  const stampNeeded = fromFile !== null && fromFile.CONFIG_VERSION !== CONFIG_VERSION;
+  merged.CONFIG_VERSION = CONFIG_VERSION;
+
   // Write the file when it is absent, or backfill it when an upgrade added new
   // keys the on-disk file is missing — so users can discover and edit them.
   // Never overwrite a file that failed to parse (fromFile === null && exists).
   const fileExists = existsSync(CONFIG_PATH);
   const backfillNeeded =
     fromFile !== null && Object.keys(DEFAULTS).some((k) => !(k in fromFile));
-  if (!fileExists || backfillNeeded) {
+  if (!fileExists || backfillNeeded || stampNeeded) {
     try {
       writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n", "utf-8");
     } catch {
@@ -362,6 +375,17 @@ function setConfigValue(target: Record<string, number | string>, pair: string): 
   if (val === "" || !Number.isFinite(num)) return `invalid: ${key}=${val}`;
   target[key] = num;
   return `${key}=${num}`;
+}
+
+// Returns the TOOL_LOOP_BAN value translated to the ≥1.5.0 scale, or null when
+// no migration applies. Only files without a CONFIG_VERSION stamp (written
+// before 1.5.0) are migrated, and only the two values the old scale had:
+// old 0 (temporary) → 1, old 1 (permanent) → 2.
+function migrateToolLoopBan(fromFile: Record<string, unknown> | null): number | null {
+  if (!fromFile || fromFile.CONFIG_VERSION !== undefined) return null;
+  const old = fromFile.TOOL_LOOP_BAN;
+  if (old !== 0 && old !== 1) return null;
+  return old + 1;
 }
 
 function jaccard(a: string, b: string): number {

@@ -62,6 +62,8 @@ Because detection requires *adjacent* repetition, an interleaved different actio
 
 Set `TOOL_LOOP_BAN: 2` to make blocks **permanent per call**: once a specific call loops, that exact call stays blocked for the rest of the session no matter what (stronger against stubborn models, but it will also block legitimate later re-runs of the same command). `TOOL_LOOP_BAN: 0` disables the detector entirely.
 
+> **Upgrading from < 1.5.0**: the `TOOL_LOOP_BAN` scale shifted by one (old `0` = temporary → new `1`, old `1` = permanent → new `2`; `0` now means off). Migration is automatic: a `loop-police.json` without a `CONFIG_VERSION` stamp is recognized as pre-1.5.0, its `TOOL_LOOP_BAN` is bumped by one to preserve the behavior you had, and the file is stamped so this happens exactly once.
+
 Detection is exact — only identical repetitions trigger it, not similar ones.
 
 ## Command

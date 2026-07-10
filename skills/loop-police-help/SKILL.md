@@ -18,6 +18,7 @@ loops in real time before they exhaust your context window.
 - **File read loop**: same file read ≥ FILE_READ_LIMIT times in one session
 - **Search spiral**: same pattern searched across ≥ SEARCH_EXPAND_LIMIT paths
 - **Tool call loop**: identical sequence of tool calls repeating
+- **Text tool-call leak**: tool invocation printed as plain text instead of a real tool call
 - **Consecutive loop**: thinking loop aborted N turns in a row (escalated warning)
 - **Malformed response**: empty assistant output or invalid tool calls
 - **Identical across prompts**: same assistant reply after a different user message
@@ -70,6 +71,7 @@ settable via `/loop-police set`. `{placeholders}` are filled at runtime:
 | `MSG_FILE_READ_LOOP` | `{path}` `{count}` |
 | `MSG_SEARCH_SPIRAL` | `{pattern}` `{paths}` |
 | `MSG_TOOL_LOOP` | `{windowSize}` |
+| `MSG_TEXT_TOOL_CALL` | — |
 
 ## Changing config
 

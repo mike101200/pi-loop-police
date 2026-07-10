@@ -22,5 +22,6 @@
   "MSG_STAGNATION": "⚠️ REASONING STAGNATION: Your thinking across the last {window} turns has been {threshold}%+ similar — you are not making progress. Stop and try a fundamentally different approach.",
   "MSG_FILE_READ_LOOP": "⚠️ FILE READ LOOP: \"{path}\" has been read {count} times. Reading it again will not yield new information — use what you already know and move forward.",
   "MSG_SEARCH_SPIRAL": "⚠️ SEARCH EXPANSION SPIRAL: Pattern \"{pattern}\" has been searched in {paths} different locations. Broadening the scope further will not help — reconsider what you are looking for.",
-  "MSG_TOOL_LOOP": "⚠️ TOOL CALL LOOP: The same sequence of {windowSize} tool call(s) is repeating identically and has been blocked — this exact call did NOT run and will keep being blocked if you repeat it. It produced no new result last time and won't now. Change your approach: try a different command, or use what you already learned to move forward."
+  "MSG_TOOL_LOOP": "⚠️ TOOL CALL LOOP: The same sequence of {windowSize} tool call(s) is repeating identically and has been blocked — this exact call did NOT run and will keep being blocked if you repeat it. It produced no new result last time and won't now. Change your approach: try a different command, or use what you already learned to move forward.",
+  "MSG_TEXT_TOOL_CALL": "⚠️ TEXT TOOL CALL LEAKED: You printed a tool invocation as plain text instead of calling the tool. The leaked text was removed from context. Continue the task — invoke the tool properly so it actually runs."
 }

@@ -76,6 +76,15 @@ Detection is exact — only identical repetitions trigger it, not similar ones.
 
 Tools listed in `COMMAND_EXCEPTION_LIST` are exempt from sequence-loop detection. The default list is empty; add tool names when a command must repeat legitimately (e.g. `wiki-ingest` for iterative wiki ingestion). Excepted tools can still run when a tool-loop latch is active. They are **not** exempt from file-read or search-spiral limits.
 
+### Text tool-call leak
+
+At `message_end`, if the assistant's visible text contains tool-call markup (`<tool_call>`, `<function=…>`, `<parameter=…>`) but Pi did **not** parse any structured `toolCall` blocks, loop-police treats it as a leak:
+
+- The leaked markup is stripped from the committed message (any preceding prose is kept).
+- A recovery message is injected and triggers a new turn so the model can invoke the tool properly.
+
+This does **not** increment the persistent failure counter or trigger model reload — it is a soft re-prompt only.
+
 ### Response quality (end of turn)
 
 At `turn_end`, the extension checks assistant output quality:
@@ -95,6 +104,7 @@ A session-scoped **persistent failure counter** increments on:
 |--------|--------|
 | Thinking / semantic / consecutive loops | `message_update` |
 | Reasoning stagnation | `message_end` |
+| Text tool-call leak | `message_end` |
 | File read loop, search spiral, tool sequence loop | `tool_call` |
 | Malformed response, identical across prompts | `turn_end` |
 

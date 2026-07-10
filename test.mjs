@@ -654,6 +654,144 @@ function shouldCountPersistFailure(message, branch, prev) {
   return { count: false, curr };
 }
 
+// tool-call-text (mirrored from extensions/tool-call-text.ts)
+const LEAK_LABEL = "[TEXT TOOL CALL LEAKED — stripped by loop-police]";
+const TOOL_CALL_TAG_RE = /<\/?tool_call\b/i;
+const FUNCTION_TAG_RE = /<function=[\w-]+/i;
+const PARAMETER_TAG_RE = /<parameter=[\w-]+/i;
+
+function findLeakStart(text) {
+  const markers = [];
+  const toolCallMatch = text.match(TOOL_CALL_TAG_RE);
+  if (toolCallMatch?.index != null) markers.push(toolCallMatch.index);
+  if (FUNCTION_TAG_RE.test(text) && PARAMETER_TAG_RE.test(text)) {
+    const functionMatch = text.match(FUNCTION_TAG_RE);
+    if (functionMatch?.index != null) markers.push(functionMatch.index);
+    const parameterMatch = text.match(PARAMETER_TAG_RE);
+    if (parameterMatch?.index != null) markers.push(parameterMatch.index);
+  }
+  return markers.length > 0 ? Math.min(...markers) : -1;
+}
+
+function hasTextToolCallLeak(text) {
+  if (!text) return false;
+  return findLeakStart(text) >= 0;
+}
+
+function stripTextToolCallLeak(text) {
+  const start = findLeakStart(text);
+  if (start < 0) return { cleaned: text, hadLeak: false };
+  const prefix = text.slice(0, start).trimEnd();
+  const cleaned = prefix ? `${prefix}\n\n${LEAK_LABEL}` : LEAK_LABEL;
+  return { cleaned, hadLeak: true };
+}
+
+function detectTextToolCallLeak(message) {
+  if (extractToolCalls(message).length > 0) return null;
+  const text = extractAssistantText(message);
+  if (!hasTextToolCallLeak(text)) return null;
+  return { text };
+}
+
+function replaceLeakedText(message) {
+  if (typeof message !== "object" || !message) return message;
+  const content = message.content;
+  if (!Array.isArray(content)) return message;
+  let changed = false;
+  const newContent = content.map((block) => {
+    if (block?.type !== "text" || typeof block.text !== "string") return block;
+    const { cleaned, hadLeak } = stripTextToolCallLeak(block.text);
+    if (!hadLeak) return block;
+    changed = true;
+    return { ...block, text: cleaned };
+  });
+  return changed ? { ...message, content: newContent } : message;
+}
+
+describe("text tool call leak", () => {
+  const leakedXml = [
+    "Tabs, not spaces. Let me use exact tab-based content:",
+    "",
+    "<tool_call>",
+    "<function=edit>",
+    "<parameter=path>",
+    "D:/Proiecte/CSharp/transport/Transport/Forms/frmCursaSearch.xaml.cs",
+    "</parameter>",
+    "<parameter=edits>",
+    '[{"oldText": "foo", "newText": "bar"}]',
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+  ].join("\n");
+
+  test("detects full tool_call XML with function and parameter tags", () => {
+    assert.ok(hasTextToolCallLeak(leakedXml));
+    assert.ok(detectTextToolCallLeak({ role: "assistant", content: [{ type: "text", text: leakedXml }] }));
+  });
+
+  test("detects incomplete tool_call at end of stream", () => {
+    const incomplete = "I'll edit the file now.\n\n<tool_call>\n<function=edit>\n<parameter=path>";
+    assert.ok(hasTextToolCallLeak(incomplete));
+    assert.ok(detectTextToolCallLeak({ role: "assistant", content: [{ type: "text", text: incomplete }] }));
+  });
+
+  test("detects function+parameter pair without outer tool_call wrapper", () => {
+    const inner = "<function=read>\n<parameter=path>/foo</parameter>\n</function>";
+    assert.ok(hasTextToolCallLeak(inner));
+  });
+
+  test("does not fire when structured toolCall blocks are present", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "text", text: leakedXml },
+        { type: "toolCall", name: "edit", arguments: { path: "/foo" } },
+      ],
+    };
+    assert.equal(detectTextToolCallLeak(message), null);
+  });
+
+  test("does not fire on normal prose mentioning tool_call", () => {
+    const prose = "Models sometimes output a tool_call tag as plain text, which is wrong.";
+    assert.ok(!hasTextToolCallLeak(prose));
+    assert.equal(detectTextToolCallLeak({ role: "assistant", content: [{ type: "text", text: prose }] }), null);
+  });
+
+  test("stripTextToolCallLeak preserves prefix text and adds label", () => {
+    const { cleaned, hadLeak } = stripTextToolCallLeak(leakedXml);
+    assert.ok(hadLeak);
+    assert.ok(cleaned.startsWith("Tabs, not spaces."));
+    assert.ok(cleaned.includes(LEAK_LABEL));
+    assert.ok(!cleaned.includes("<tool_call>"));
+  });
+
+  test("stripTextToolCallLeak on leak-only text yields label only", () => {
+    const { cleaned, hadLeak } = stripTextToolCallLeak("<tool_call>\n<function=edit>");
+    assert.ok(hadLeak);
+    assert.equal(cleaned, LEAK_LABEL);
+  });
+
+  test("replaceLeakedText mutates only text blocks", () => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "planning the edit" },
+        { type: "text", text: leakedXml },
+      ],
+    };
+    const cleaned = replaceLeakedText(message);
+    assert.notEqual(cleaned, message);
+    assert.equal(cleaned.content[0].thinking, "planning the edit");
+    assert.ok(cleaned.content[1].text.includes(LEAK_LABEL));
+    assert.ok(!cleaned.content[1].text.includes("<tool_call>"));
+  });
+
+  test("replaceLeakedText leaves healthy messages unchanged", () => {
+    const message = { role: "assistant", content: [{ type: "text", text: "All done." }] };
+    assert.equal(replaceLeakedText(message), message);
+  });
+});
+
 describe("deriveAdminBaseUrl", () => {
   test("strips /v1 suffix", () => assert.equal(deriveAdminBaseUrl("http://localhost:8020/v1"), "http://localhost:8020"));
   test("strips /v1/ suffix", () => assert.equal(deriveAdminBaseUrl("http://127.0.0.1:8080/v1/"), "http://127.0.0.1:8080"));

@@ -9,6 +9,7 @@ import {
   shouldCountPersistFailure,
   type PromptFingerprints,
 } from "./response-quality.ts";
+import { detectTextToolCallLeak, replaceLeakedText } from "./tool-call-text.ts";
 
 // Config lives next to the extension file: ./extensions/loop-police.json
 // Auto-created on first load with defaults; travels with the extension.
@@ -59,6 +60,8 @@ const MESSAGE_DEFAULTS = {
     '⚠️ SEARCH EXPANSION SPIRAL: Pattern "{pattern}" has been searched in {paths} different locations. Broadening the scope further will not help — reconsider what you are looking for.',
   MSG_TOOL_LOOP:
     "⚠️ TOOL CALL LOOP: The same sequence of {windowSize} tool call(s) is repeating identically and has been blocked — this exact call did NOT run and will keep being blocked if you repeat it. It produced no new result last time and won't now. Change your approach: try a different command, or use what you already learned to move forward.",
+  MSG_TEXT_TOOL_CALL:
+    "⚠️ TEXT TOOL CALL LEAKED: You printed a tool invocation as plain text instead of calling the tool. The leaked text was removed from context. Continue the task — invoke the tool properly so it actually runs.",
 };
 
 const DEFAULTS = { ...NUMERIC_DEFAULTS, ...MESSAGE_DEFAULTS };
@@ -260,6 +263,16 @@ export default function (pi: ExtensionAPI) {
     // Clean turn — the model produced a non-looping thinking block, so it is
     // making progress. Clear the consecutive-loop escalation counter.
     consecutiveLoopCount = 0;
+
+    const leak = detectTextToolCallLeak(event.message);
+    if (leak) {
+      const cleaned = replaceLeakedText(event.message);
+      pi.sendMessage(
+        { customType: "loop-police", content: String(cfg.MSG_TEXT_TOOL_CALL), display: true },
+        { triggerTurn: true }
+      );
+      return { message: cleaned };
+    }
 
     // Cross-turn stagnation: only run on clean (non-aborted) turns
     const thinking = extractThinking(event.message);

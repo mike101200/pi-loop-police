@@ -60,8 +60,12 @@ const MESSAGE_DEFAULTS = {
     '⚠️ SEARCH EXPANSION SPIRAL: Pattern "{pattern}" has been searched in {paths} different locations. Broadening the scope further will not help — reconsider what you are looking for.',
   MSG_TOOL_LOOP:
     "⚠️ TOOL CALL LOOP: The same sequence of {windowSize} tool call(s) is repeating identically and has been blocked — this exact call did NOT run and will keep being blocked if you repeat it. It produced no new result last time and won't now. Change your approach: try a different command, or use what you already learned to move forward.",
+  // Fix B: Stronger imperative, mechanism reminder, negative instruction
   MSG_TEXT_TOOL_CALL:
-    "⚠️ TEXT TOOL CALL LEAKED: You printed a tool invocation as plain text instead of calling the tool. The leaked text was removed from context. Continue the task — invoke the tool properly so it actually runs.",
+    "⚠️ TEXT TOOL CALL LEAKED: You printed a tool invocation as plain text instead of making a proper tool call. The leaked text has been removed. Your current task is still active — please invoke the tool you intended to use using the correct tool calling mechanism. Do not print tool calls as text. Make the actual tool call now.",
+  // New: message for when model goes silent after leak recovery (Fix C)
+  MSG_TEXT_TOOL_CALL_SILENCE:
+    "⚠️ YOUR PREVIOUS RESPONSE WAS EMPTY: Your last tool call was malformed and could not execute. Please retry the tool call you were attempting. Use the proper tool calling interface — do not print tool calls as plain text.",
 };
 
 const DEFAULTS = { ...NUMERIC_DEFAULTS, ...MESSAGE_DEFAULTS };
@@ -114,6 +118,10 @@ export default function (pi: ExtensionAPI) {
   let reloadInProgress = false;
   let lastResolvedAdminUrl: string | null = null;
   let lastPromptFingerprints: PromptFingerprints | null = null;
+
+  // Fix C: Track whether the last turn was a leak recovery so we can detect
+  // post-leak silence (model produced empty response after recovery).
+  let lastTurnWasLeakRecovery = false;
 
   async function recordPersistFailure(reason: string, ctx: ExtensionContext) {
     persistFailureCount++;
@@ -193,6 +201,7 @@ export default function (pi: ExtensionAPI) {
     consecutiveLoopCount = 0;
     persistFailureCount = 0;
     lastPromptFingerprints = null;
+    lastTurnWasLeakRecovery = false;
   }
 
   pi.on("agent_start", reset);
@@ -267,6 +276,18 @@ export default function (pi: ExtensionAPI) {
     const leak = detectTextToolCallLeak(event.message);
     if (leak) {
       const cleaned = replaceLeakedText(event.message);
+      lastTurnWasLeakRecovery = true;
+
+      // Gap #3: If structural toolCalls also exist alongside the leaked text,
+      // log a warning. The structural call may have been extracted from leaked
+      // XML that the model printed as text, not as a proper tool-use block.
+      if (leak.hasStructuralToolCalls) {
+        ctx.ui.notify(
+          "⚠️ TEXT LEAK + STRUCTURAL CALL: tool call extracted structurally AND leaked as text — may cause silent failure",
+          "warning"
+        );
+      }
+
       pi.sendMessage(
         { customType: "loop-police", content: String(cfg.MSG_TEXT_TOOL_CALL), display: true },
         { triggerTurn: true }
@@ -384,6 +405,30 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (event, ctx) => {
     if (!isEnabled() || event.message.role !== "assistant") return;
 
+    // Fix C: Detect post-leak silence
+    // If the last turn was a leak recovery and the model produced an empty or
+    // near-empty response with no tool calls, inject a stronger recovery message.
+    if (lastTurnWasLeakRecovery) {
+      const assistantText = extractAssistantTextFromMessage(event.message);
+      const toolCalls = extractToolCallsFromMessage(event.message);
+
+      if ((assistantText.length < 20 || !assistantText) && toolCalls.length === 0) {
+        // Model went silent after leak recovery — inject task restatement
+        ctx.ui.notify("⚠️ POST-LEAK SILENCE: model produced empty response after leak recovery", "warning");
+        lastTurnWasLeakRecovery = false;
+        pi.sendMessage(
+          {
+            customType: "loop-police",
+            content: String(cfg.MSG_TEXT_TOOL_CALL_SILENCE),
+            display: true,
+          },
+          { triggerTurn: true }
+        );
+        return;
+      }
+    }
+    lastTurnWasLeakRecovery = false;
+
     const branch = ctx.sessionManager.getBranch() as unknown[];
     const quality = shouldCountPersistFailure(event.message, branch, lastPromptFingerprints);
 
@@ -435,6 +480,7 @@ export default function (pi: ExtensionAPI) {
           `  reload in progress:  ${reloadInProgress}`,
           `  last reload:         ${lastReloadAt ? new Date(lastReloadAt).toISOString() : "never"}`,
           `  admin URL:           ${lastResolvedAdminUrl ?? (ctx.model?.baseUrl ? deriveAdminBaseUrl(ctx.model.baseUrl) : "n/a")}`,
+          `  leak recovery active: ${lastTurnWasLeakRecovery}`,
           "",
           "  config (set KEY=VAL to change):",
           ...Object.keys(NUMERIC_DEFAULTS).map((k) => `    ${k}=${cfg[k]}`),
@@ -632,4 +678,39 @@ function stableStringify(val: unknown): string {
   if (Array.isArray(val)) return `[${val.map(stableStringify).join(",")}]`;
   const keys = Object.keys(val as object).sort();
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify((val as any)[k])}`).join(",")}}`;
+}
+
+// Fix C: Helpers to extract text/tool calls from turn_end messages
+function extractAssistantTextFromMessage(message: unknown): string {
+  if (typeof message !== "object" || !message) return "";
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    if (typeof content === "string") return content;
+    return "";
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || !block) continue;
+    const b = block as Record<string, unknown>;
+    if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
+  }
+  return parts.join("\n").trim();
+}
+
+function extractToolCallsFromMessage(message: unknown): Array<{ name: string; args: unknown }> {
+  if (typeof message !== "object" || !message) return [];
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return [];
+
+  const calls: Array<{ name: string; args: unknown }> = [];
+  for (const block of content) {
+    if (typeof block !== "object" || !block) continue;
+    const b = block as Record<string, unknown>;
+    if (b.type === "toolCall" || b.type === "tool_use") {
+      const name = typeof b.name === "string" ? b.name : typeof b.toolName === "string" ? b.toolName : "";
+      const args = b.arguments ?? b.input ?? b.args ?? {};
+      calls.push({ name, args });
+    }
+  }
+  return calls;
 }

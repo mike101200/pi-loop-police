@@ -8,6 +8,12 @@ const TOOL_CALL_TAG_RE = /<\/?tool_call\b/i;
 const FUNCTION_TAG_RE = /<function=[\w-]+/i;
 const PARAMETER_TAG_RE = /<parameter=[\w-]+/i;
 
+// Additional patterns for missed formats (Gap #1)
+const TOOL_CODE_TAG_RE = /<\/?tool_code\b/i;
+const INVOKE_TAG_RE = /<invoke[\s>]/i;
+const JSON_TOOL_CALL_RE = /"name"\s*:\s*["\w-]+"\s*,\s*"arguments"/i;
+const FUNCTION_CALLING_RE = /"type"\s*:\s*"function"\s*,\s*"function"/i;
+
 function findLeakStart(text: string): number {
   const markers: number[] = [];
 
@@ -21,6 +27,19 @@ function findLeakStart(text: string): number {
     const parameterMatch = text.match(PARAMETER_TAG_RE);
     if (parameterMatch?.index != null) markers.push(parameterMatch.index);
   }
+
+  // Additional pattern checks (Gap #1 fixes)
+  const toolCodeMatch = text.match(TOOL_CODE_TAG_RE);
+  if (toolCodeMatch?.index != null) markers.push(toolCodeMatch.index);
+
+  const invokeMatch = text.match(INVOKE_TAG_RE);
+  if (invokeMatch?.index != null) markers.push(invokeMatch.index);
+
+  const jsonMatch = text.match(JSON_TOOL_CALL_RE);
+  if (jsonMatch?.index != null) markers.push(jsonMatch.index);
+
+  const funcCallingMatch = text.match(FUNCTION_CALLING_RE);
+  if (funcCallingMatch?.index != null) markers.push(funcCallingMatch.index);
 
   return markers.length > 0 ? Math.min(...markers) : -1;
 }
@@ -41,15 +60,24 @@ export function stripTextToolCallLeak(text: string): { cleaned: string; hadLeak:
 
 export interface TextToolCallLeakInfo {
   text: string;
+  // Gap #3: track whether structural toolCalls also exist alongside the leaked text
+  hasStructuralToolCalls: boolean;
 }
 
 export function detectTextToolCallLeak(message: unknown): TextToolCallLeakInfo | null {
-  if (extractToolCalls(message).length > 0) return null;
+  const toolCalls = extractToolCalls(message);
+  const hasStructural = toolCalls.length > 0;
+
+  // Gap #3 fix: even if structural toolCalls exist, still check text blocks.
+  // Previously we bailed early (if hasStructural return null) which meant a
+  // message with BOTH valid toolCalls AND leaked text was never caught.
+  // We now detect in both cases but signal the difference so the caller can
+  // decide whether to strip (hasStructural=false) or warn (hasStructural=true).
 
   const text = extractAssistantText(message);
   if (!hasTextToolCallLeak(text)) return null;
 
-  return { text };
+  return { text, hasStructuralToolCalls: hasStructural };
 }
 
 export function replaceLeakedText(message: unknown): unknown {

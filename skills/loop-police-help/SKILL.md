@@ -49,12 +49,14 @@ loops in real time before they exhaust your context window.
 | `CONSECUTIVE_LOOP_LIMIT` | `2` | Escalated warning after N thinking-loop aborts in a row (across turns) |
 | `ENABLED` | `true` | Master switch for all loop detection |
 | `COMMAND_EXCEPTION_LIST` | `(empty)` | Tools exempt from sequence-loop detection — e.g. `wiki-ingest` for wiki workflows |
-| `TOOL_LOOP_BAN` | `0` | `0` = block identical call only while repeated back-to-back; `1` = ban that exact call for the rest of the session |
+| `TOOL_LOOP_BAN` | `1` | `0` = off; `1` = block identical call only while repeated back-to-back; `2` = ban that exact call for the rest of the session |
 | `MODEL_RELOAD_ENABLED` | `true` | Reload llama.cpp model after persistent failures |
 | `MODEL_RELOAD_THRESHOLD` | `3` | Persistent failures before model reload |
 | `MODEL_RELOAD_COOLDOWN_MS` | `120000` | Minimum ms between reload attempts |
 
 Model reload uses the active Pi model's `baseUrl` from `models.json` or pi-llama-cpp — no separate server URL in loop-police.json.
+
+Setting a detector's key to `0` disables it: `MIN_THINKING_WINDOW=0` (thinking loop), `PARA_LOOP_THRESHOLD=0` (semantic loop), `STAGNATION_WINDOW=0` (stagnation), `FILE_READ_LIMIT=0` (file read loop), `SEARCH_EXPAND_LIMIT=0` (search spiral), `CONSECUTIVE_LOOP_LIMIT=0` (escalated warning), `TOOL_LOOP_BAN=0` (tool call loop).
 
 ## Message templates
 

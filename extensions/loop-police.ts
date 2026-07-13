@@ -16,6 +16,14 @@ import { detectTextToolCallLeak, replaceLeakedText } from "./tool-call-text.ts";
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(EXT_DIR, "loop-police.json");
 
+// Setting a detector's key to 0 disables that detector entirely:
+//   MIN_THINKING_WINDOW=0    → character-level thinking loop off
+//   PARA_LOOP_THRESHOLD=0    → semantic loop off
+//   STAGNATION_WINDOW=0      → cross-turn stagnation off
+//   FILE_READ_LIMIT=0        → file read loop off
+//   SEARCH_EXPAND_LIMIT=0    → search expansion spiral off
+//   CONSECUTIVE_LOOP_LIMIT=0 → escalated consecutive-loop message off
+//   TOOL_LOOP_BAN=0          → tool call sequence loop off
 const NUMERIC_DEFAULTS = {
   ENABLED: 1, // 1 = true, stored as number for /loop-police set compatibility
   MIN_THINKING_WINDOW: 80,
@@ -33,8 +41,9 @@ const NUMERIC_DEFAULTS = {
   MODEL_RELOAD_ENABLED: 1, // 1 = true
   MODEL_RELOAD_THRESHOLD: 3,
   MODEL_RELOAD_COOLDOWN_MS: 120000,
-  TOOL_LOOP_BAN: 0, // 0 = block identical call only while repeated back-to-back;
-  //                   1 = ban that exact call for the rest of the session
+  TOOL_LOOP_BAN: 1, // 0 = detector off;
+                    // 1 = block identical call only while repeated back-to-back;
+                    // 2 = ban that exact call for the rest of the session
 };
 
 // Recovery messages injected into the agent when a loop is detected. Edit these
@@ -70,6 +79,10 @@ const MESSAGE_DEFAULTS = {
 
 const DEFAULTS = { ...NUMERIC_DEFAULTS, ...MESSAGE_DEFAULTS };
 
+// Stamped into loop-police.json. Files written before 1.5.0 lack it, which is
+// how migrateToolLoopBan() recognizes the old TOOL_LOOP_BAN scale.
+const CONFIG_VERSION = 2;
+
 const cfg: typeof DEFAULTS & Record<string, number | string | boolean | string[]> = (() => {
   // Read the existing config (null = missing or unreadable/corrupt).
   let fromFile: Record<string, unknown> | null = null;
@@ -81,13 +94,22 @@ const cfg: typeof DEFAULTS & Record<string, number | string | boolean | string[]
   const merged = { ...DEFAULTS, ...(fromFile ?? {}) } as typeof DEFAULTS &
     Record<string, number | string | boolean | string[]>;
 
+  // Pre-1.5.0 configs used a shifted TOOL_LOOP_BAN scale (0 = temporary,
+  // 1 = permanent); 1.5.0 inserted 0 = off below it. Bump the stored value by
+  // one so the old behavior is preserved, then stamp the file so this runs
+  // exactly once.
+  const migratedBan = migrateToolLoopBan(fromFile);
+  if (migratedBan !== null) merged.TOOL_LOOP_BAN = migratedBan;
+  const stampNeeded = fromFile !== null && fromFile.CONFIG_VERSION !== CONFIG_VERSION;
+  merged.CONFIG_VERSION = CONFIG_VERSION;
+
   // Write the file when it is absent, or backfill it when an upgrade added new
   // keys the on-disk file is missing — so users can discover and edit them.
   // Never overwrite a file that failed to parse (fromFile === null && exists).
   const fileExists = existsSync(CONFIG_PATH);
   const backfillNeeded =
     fromFile !== null && Object.keys(DEFAULTS).some((k) => !(k in fromFile));
-  if (!fileExists || backfillNeeded) {
+  if (!fileExists || backfillNeeded || stampNeeded) {
     try {
       writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n", "utf-8");
     } catch {
@@ -217,17 +239,20 @@ export default function (pi: ExtensionAPI) {
     // toolHistory / bannedCalls also persist across turns (reset on agent_start).
   });
 
-  pi.on("message_update", async (event, ctx) => {
+  pi.on("message_update", (event, ctx) => {
     if (!isEnabled() || thinkingAborted || event.message.role !== "assistant") return;
+    const charLoopOn = cfg.MIN_THINKING_WINDOW > 0;
+    const semanticLoopOn = cfg.PARA_LOOP_THRESHOLD > 0;
+    if (!charLoopOn && !semanticLoopOn) return;
     const thinking = extractThinking(event.message);
     if (!thinking || thinking.length < lastCheckedLen + cfg.CHECK_STRIDE) return;
     lastCheckedLen = thinking.length;
-    if (thinking.length < cfg.MIN_THINKING_WINDOW * 2) return;
+    if (charLoopOn && thinking.length < cfg.MIN_THINKING_WINDOW * 2) return;
 
-    let repeat = detectRepeatingSuffix(thinking);
+    let repeat = charLoopOn ? detectRepeatingSuffix(thinking) : null;
     if (repeat) {
       loopType = "character";
-    } else {
+    } else if (semanticLoopOn) {
       repeat = detectSemanticLoop(thinking);
       if (repeat) loopType = "semantic";
     }
@@ -255,7 +280,7 @@ export default function (pi: ExtensionAPI) {
         ? "[SEMANTIC LOOP — truncated by loop-police]"
         : "[THINKING LOOP — truncated by loop-police]";
       const advice =
-        consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT
+        cfg.CONSECUTIVE_LOOP_LIMIT > 0 && consecutiveLoopCount >= cfg.CONSECUTIVE_LOOP_LIMIT
           ? fmt(cfg.MSG_CONSECUTIVE_LOOP, { count: consecutiveLoopCount })
           : isSemantic
             ? String(cfg.MSG_SEMANTIC_LOOP)
@@ -296,6 +321,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Cross-turn stagnation: only run on clean (non-aborted) turns
+    if (cfg.STAGNATION_WINDOW <= 0) return;
     const thinking = extractThinking(event.message);
     if (thinking) {
       thinkingHistory.push(thinking);
@@ -330,7 +356,7 @@ export default function (pi: ExtensionAPI) {
     const excepted = isExceptedTool(event.toolName);
 
     // File read repetition
-    if (isReadTool(event.toolName)) {
+    if (cfg.FILE_READ_LIMIT > 0 && isReadTool(event.toolName)) {
       const path = getInputPath(event.input);
       if (path) {
         const readKey = getFileReadKey(path, event.input);
@@ -353,7 +379,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Search expansion spiral
-    if (isSearchTool(event.toolName)) {
+    if (cfg.SEARCH_EXPAND_LIMIT > 0 && isSearchTool(event.toolName)) {
       const pattern = getSearchPattern(event.input);
       if (pattern) {
         const searchPath = getInputPath(event.input) ?? "*";
@@ -378,17 +404,25 @@ export default function (pi: ExtensionAPI) {
 
     // Tool call sequence loop (excepted tools may repeat, e.g. wiki-ingest)
     if (!excepted) {
-      // Permanent-ban mode (TOOL_LOOP_BAN=1): once a call has looped, that exact
-      // call stays blocked for the rest of the session, no matter what.
+      if (cfg.TOOL_LOOP_BAN <= 0) {
+        // Detector off — just track history, don't block
+        const hash = hashToolCall(event.toolName, event.input);
+        toolHistory.push(hash);
+        return;
+      }
+
       const hash = hashToolCall(event.toolName, event.input);
-      if (cfg.TOOL_LOOP_BAN && bannedCalls.has(hash)) {
+
+      // Permanent-ban mode (TOOL_LOOP_BAN>=2): once a call has looped, that exact
+      // call stays blocked for the rest of the session, no matter what.
+      if (cfg.TOOL_LOOP_BAN >= 2 && bannedCalls.has(hash)) {
         ctx.ui.notify(`⚠️ TOOL LOOP: identical call blocked (banned)`, "warning");
         return { block: true, reason: fmt(cfg.MSG_TOOL_LOOP, { windowSize: 1 }) };
       }
 
       const windowSize = detectSequenceRepeat([...toolHistory, hash]);
       if (windowSize > 0) {
-        if (cfg.TOOL_LOOP_BAN) bannedCalls.add(hash);
+        if (cfg.TOOL_LOOP_BAN >= 2) bannedCalls.add(hash);
         void recordPersistFailure("tool call loop", ctx);
         ctx.ui.notify(`⚠️ TOOL LOOP: ${windowSize}-call sequence repeating — blocked`, "warning");
         // Do NOT record the blocked call: toolHistory stays at the looping state
@@ -526,6 +560,17 @@ function setConfigValue(target: Record<string, number | string>, pair: string): 
   if (val === "" || !Number.isFinite(num)) return `invalid: ${key}=${val}`;
   target[key] = num;
   return `${key}=${num}`;
+}
+
+// Returns the TOOL_LOOP_BAN value translated to the ≥1.5.0 scale, or null when
+// no migration applies. Only files without a CONFIG_VERSION stamp (written
+// before 1.5.0) are migrated, and only the two values the old scale had:
+// old 0 (temporary) → 1, old 1 (permanent) → 2.
+function migrateToolLoopBan(fromFile: Record<string, unknown> | null): number | null {
+  if (!fromFile || fromFile.CONFIG_VERSION !== undefined) return null;
+  const old = fromFile.TOOL_LOOP_BAN;
+  if (old !== 0 && old !== 1) return null;
+  return old + 1;
 }
 
 function jaccard(a: string, b: string): number {

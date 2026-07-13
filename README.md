@@ -70,7 +70,9 @@ Before each tool executes, the extension hashes `toolName + stableStringify(args
 
 Because detection requires *adjacent* repetition, an interleaved different action breaks it: `build → edit → build` does not trip, so legitimate re-runs after real changes are fine. As long as the model keeps repeating the identical call back-to-back, it keeps getting blocked.
 
-Set `TOOL_LOOP_BAN: 1` to make blocks **permanent per call**: once a specific call loops, that exact call stays blocked for the rest of the session no matter what (stronger against stubborn models, but it will also block legitimate later re-runs of the same command).
+Set `TOOL_LOOP_BAN: 2` to make blocks **permanent per call**: once a specific call loops, that exact call stays blocked for the rest of the session no matter what (stronger against stubborn models, but it will also block legitimate later re-runs of the same command). `TOOL_LOOP_BAN: 0` disables the detector entirely.
+
+> **Upgrading from < 1.5.0**: the `TOOL_LOOP_BAN` scale shifted by one (old `0` = temporary → new `1`, old `1` = permanent → new `2`; `0` now means off). Migration is automatic: a `loop-police.json` without a `CONFIG_VERSION` stamp is recognized as pre-1.5.0, its `TOOL_LOOP_BAN` is bumped by one to preserve the behavior you had, and the file is stamped so this happens exactly once.
 
 Detection is exact — only identical repetitions trigger it, not similar ones.
 
@@ -186,8 +188,9 @@ FILE_READ_LIMIT: 4                // reads of same file + line range before bloc
 SEARCH_EXPAND_LIMIT: 3            // unique paths for same search pattern before blocking
 CONSECUTIVE_LOOP_LIMIT: 2          // thinking loops in a row before hard abort
 COMMAND_EXCEPTION_LIST: []         // tools exempt from sequence-loop detection (empty by default)
-TOOL_LOOP_BAN: 0                   // 0 = block identical call only while repeated back-to-back
-                                   // 1 = ban that exact call for the rest of the session
+TOOL_LOOP_BAN: 1                   // 0 = off
+                                   // 1 = block identical call only while repeated back-to-back
+                                   // 2 = ban that exact call for the rest of the session
 MODEL_RELOAD_ENABLED: true        // reload llama.cpp model after persistent failures
 MODEL_RELOAD_THRESHOLD: 3         // persistent failures before model reload
 MODEL_RELOAD_COOLDOWN_MS: 120000  // min ms between reload attempts (2 min)
@@ -224,6 +227,20 @@ Exempt `wiki-ingest` from tool-sequence loop detection (iterative wiki ingestion
 - Add tool names to `COMMAND_EXCEPTION_LIST` for commands that must repeat (e.g. wiki ingestion).
 - Raise `MODEL_RELOAD_THRESHOLD` or `MODEL_RELOAD_COOLDOWN_MS` if reloads fire too aggressively on local models.
 
+### Disabling individual detectors
+
+Setting a detector's key to `0` turns that detector off entirely:
+
+| Key = 0 | Disables |
+|---------|----------|
+| `MIN_THINKING_WINDOW=0` | character-level thinking loop |
+| `PARA_LOOP_THRESHOLD=0` | semantic (paragraph) loop |
+| `STAGNATION_WINDOW=0` | cross-turn stagnation |
+| `FILE_READ_LIMIT=0` | file read loop |
+| `SEARCH_EXPAND_LIMIT=0` | search expansion spiral |
+| `CONSECUTIVE_LOOP_LIMIT=0` | escalated consecutive-loop message |
+| `TOOL_LOOP_BAN=0` | tool call sequence loop |
+
 ### Customizing recovery messages
 
 The text injected when a loop is detected is configurable — some models respond better to different phrasing. These live alongside the numeric config in `loop-police.json` as `MSG_*` keys:
@@ -239,6 +256,13 @@ The text injected when a loop is detected is configurable — some models respon
 | `MSG_TOOL_LOOP` | identical tool-call sequence repeating | `{windowSize}` |
 
 `{placeholder}` tokens are substituted at runtime; unknown tokens are left as-is so a typo stays visible. Messages are edited in `loop-police.json` only — `/loop-police set` handles numeric keys and will refuse a `MSG_*` key.
+
+## Skills
+
+Two skills ship with the extension:
+
+- **loop-police-help** — reference card: commands, config keys, and where the persistent `loop-police.json` lives for each install type.
+- **loop-police-postmortem** — asks the agent to analyze the loop-police detections in the current session: reconstruct what triggered each firing, classify it (justified / false positive / justified-but-ineffective), and recommend config changes where tuning could have avoided it — as a `/loop-police set` line plus a `loop-police.json` snippet. Trigger it with things like *"why did loop-police fire?"*, *"was that a false positive?"*, or *"do a loop post-mortem"*.
 
 ## Compatibility
 
